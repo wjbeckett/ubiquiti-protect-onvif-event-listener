@@ -230,15 +230,43 @@ cmake(
     visibility = ["//visibility:public"],
 )
 
+# ---- nghttp2 1.64.0 (http_archive) ----
+# HTTP/2 protocol library.  libcurl links this for HTTP/2 transport support,
+# which we need to call the UniFi MSR gRPC service on 127.0.0.1:7700.
+# ENABLE_LIB_ONLY builds just libnghttp2.a (no apps/examples/tests).
+cmake(
+    name = "nghttp2",
+    lib_source = "@nghttp2_src//:all",
+    out_static_libs = ["libnghttp2.a"],
+    cache_entries = {
+        "ENABLE_LIB_ONLY": "ON",
+        "BUILD_STATIC_LIBS": "ON",
+        "BUILD_SHARED_LIBS": "OFF",
+        "ENABLE_DOC": "OFF",
+        "ENABLE_FAILMALLOC": "OFF",
+        "ENABLE_APP": "OFF",
+        "ENABLE_HPACK_TOOLS": "OFF",
+        "ENABLE_EXAMPLES": "OFF",
+        "ENABLE_PYTHON_BINDINGS": "OFF",
+        "BUILD_TESTING": "OFF",
+        "CMAKE_INSTALL_LIBDIR": "lib",
+        "CMAKE_POSITION_INDEPENDENT_CODE": "ON",
+    },
+    visibility = ["//visibility:public"],
+)
+
 # ---- libcurl (git submodule: third_party/curl) ----
-# HTTP/HTTPS only; OpenSSL backend; all other protocols and optional libs disabled.
+# HTTP/HTTPS only; OpenSSL backend; all other protocols disabled.
+# HTTP/2 is enabled via nghttp2 so we can talk gRPC to the MSR service.
 cmake(
     name = "libcurl",
     lib_source = "@curl_src//:all",
-    deps = [":openssl"],
+    deps = [":openssl", ":nghttp2"],
     out_static_libs = ["libcurl.a"],
     cache_entries = {
         "BUILD_SHARED_LIBS": "OFF",
+        "BUILD_STATIC_LIBS": "ON",
+        "BUILD_CURL_EXE": "OFF",
         "BUILD_TESTING": "OFF",
         "CURL_USE_PKGCONFIG": "OFF",
         "CURL_USE_OPENSSL": "ON",
@@ -261,11 +289,13 @@ cmake(
         "CURL_DISABLE_RTSP": "ON",
         "CURL_DISABLE_SMB": "ON",
         "CURL_DISABLE_WEBSOCKETS": "ON",
-        "USE_NGHTTP2": "OFF",
+        "USE_NGHTTP2": "ON",
         "CURL_BROTLI": "OFF",
         "CURL_ZSTD": "OFF",
         "USE_LIBIDN2": "OFF",
         "OPENSSL_ROOT_DIR": "$$EXT_BUILD_DEPS$$/openssl",
+        "NGHTTP2_INCLUDE_DIR": "$$EXT_BUILD_DEPS$$/nghttp2/include",
+        "NGHTTP2_LIBRARY": "$$EXT_BUILD_DEPS$$/nghttp2/lib/libnghttp2.a",
         "CMAKE_INSTALL_LIBDIR": "lib",
     },
     visibility = ["//visibility:public"],

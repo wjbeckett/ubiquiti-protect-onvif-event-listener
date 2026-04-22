@@ -83,6 +83,17 @@ http_archive(
     build_file_content = _FILEGROUP_BUILD,
 )
 
+# nghttp2 1.64.0 — HTTP/2 protocol library used by libcurl.
+# Enables HTTP/2 in libcurl so we can call the UniFi MSR gRPC service
+# (cleartext HTTP/2 on 127.0.0.1:7700) via curl_easy_perform.
+http_archive(
+    name = "nghttp2_src",
+    sha256 = "88bb94c9e4fd1c499967f83dece36a78122af7d5fb40da2019c56b9ccc6eb9dd",
+    strip_prefix = "nghttp2-1.64.0",
+    urls = ["https://github.com/nghttp2/nghttp2/releases/download/v1.64.0/nghttp2-1.64.0.tar.xz"],
+    build_file_content = _FILEGROUP_BUILD,
+)
+
 # GNU libmicrohttpd 1.0.1 — embedded HTTP server (test-only fake camera).
 # Built without HTTPS (--disable-https) so GnuTLS/GMP/Nettle/tasn1 are not
 # required at all; only pthreads (always dynamic/system) is needed.

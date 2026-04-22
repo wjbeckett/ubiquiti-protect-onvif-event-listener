@@ -39,6 +39,7 @@
 #include "absl/status/statusor.h"
 #include "alarm_notifier.hpp"
 #include "jpeg_crop.hpp"
+#include "msr_client.hpp"
 #include "object_detect.hpp"
 #include "ubv_thumbnail.hpp"
 
@@ -938,6 +939,11 @@ void DetectionRecorder::set_alarm_notifier(AlarmNotifier* notifier) {
   alarm_notifier_ = notifier;
 }
 
+void DetectionRecorder::set_msr_client(MsrClient* msr) {
+  std::lock_guard<std::mutex> lk(mu_);
+  msr_client_ = msr;
+}
+
 void DetectionRecorder::set_detector(
     const object_detect::ObjectDetector* detector) {
   std::lock_guard<std::mutex> lk(mu_);
@@ -1028,6 +1034,7 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     const object_detect::ObjectDetector* det_ptr;
     bool det_override;
     AlarmNotifier* alarm_notif;
+    MsrClient* msr;
     // Non-empty when merging this detection into an existing event row.
     std::string coalesced_event_id;
     {
@@ -1088,6 +1095,7 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
       det_ptr      = detector_;
       det_override = detect_override_;
       alarm_notif  = alarm_notifier_;
+      msr          = msr_client_;
     }
 
     // 2. Compute timestamps and IDs (no lock -- needs ip_to_mac_ which is read-only).
@@ -1098,7 +1106,8 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
                                                               : coalesced_event_id;
     const std::string sdo_id     = util::generate_uuid();
     const std::string sdr_id     = util::generate_uuid();
-    const std::string thumb_id   = db_->make_thumbnail_id(ev.camera_ip, ts_ms);
+    // thumb_id is finalised below, after a potential MSR StoreSnapshots call.
+    std::string thumb_id;
     std::string sdt_json   = smart_detect_types_json(det->type);
     std::string obj_type   = sdo_type(det->type);
     const std::string attributes = "{\"confidence\":0,\"zone\":[1]}";
@@ -1175,6 +1184,28 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
                 << "— thumbnail will be missing";
     }
 
+    // 3b. Forward the cropped JPEG to MSR when configured.  MSR persists it as
+    // a native UBV thumbnail and returns an id that the Protect UI serves via
+    // MSP TCP — indistinguishable from first-party cameras.
+    bool stored_by_msr = false;
+    if (msr && !snapshot.empty() && !cam_mac.empty()) {
+      std::string msr_id = msr->StoreSnapshot(
+          cam_mac, snapshot.data(), snapshot.size());
+      if (!msr_id.empty()) {
+        thumb_id = msr_id;
+        stored_by_msr = true;
+        LOG(INFO) << '[' << ev.camera_ip << "] MSR stored snapshot as id="
+                  << msr_id;
+      } else {
+        LOG(WARNING) << '[' << ev.camera_ip
+                     << "] MSR StoreSnapshots failed; "
+                     << "falling back to local thumbnail write";
+      }
+    }
+    if (thumb_id.empty()) {
+      thumb_id = db_->make_thumbnail_id(ev.camera_ip, ts_ms);
+    }
+
     // 4. INSERT into both tables, write thumbnail -- all under lock.
     {
       std::lock_guard<std::mutex> lk(mu_);
@@ -1215,7 +1246,9 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
       }
 
       // Thumbnail: UBV file (if ubv_dir set) + PG thumbnails table.
-      if (!snapshot.empty()) {
+      // Skipped when MSR has already stored the snapshot natively — MSR owns
+      // both the UBV file and MSP TCP lookup path in that case.
+      if (!snapshot.empty() && !stored_by_msr) {
         if (!ubv_dir.empty()) {
           std::string ubv_path;
           if (!cam_mac.empty()) {

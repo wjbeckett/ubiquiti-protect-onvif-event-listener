@@ -89,6 +89,8 @@ src/
   motion_poller.hpp/.cpp        — First-party camera motion → smart detect poller
                                     Polls events table, runs NanoDet-M on Protect thumbnails
   alarm_notifier.hpp/.cpp       — Protect API alarm notifier (triggers automations on smart detect)
+  msr_client.hpp/.cpp           — UniFi MSR gRPC client (forwards thumbnails via RecordingAPI.StoreSnapshots
+                                    over HTTP/2 cleartext on 127.0.0.1:7700)
   camera_change_log.hpp/.cpp    — Cameras-table change log and rollback support
   protect_ui_patch.hpp/.cpp     — Live-patch Protect UI alarm picker for third-party cameras
   ubv_thumbnail.hpp/.cpp        — UBV container encode/decode (thumbnail storage)
@@ -119,6 +121,7 @@ test/
   test_protect_ui_patch.cpp       — UI patch apply/revert tests
   test_unifi_camera_config.cpp   — DB connection string / JSON / PG array helper tests
   test_motion_poller.cpp          — Smart detect type / SDR payload helper tests
+  test_msr_client.cpp             — MSR gRPC wire-format encode/decode tests
   bench_onvif_listener.cpp        — ONVIF parsing throughput benchmark
   bench_jpeg_crop.cpp             — JPEG crop throughput benchmark
   bench_object_detect.cpp         — NanoDet-M inference latency benchmark
@@ -250,6 +253,7 @@ All configuration is now via `absl::flags`. Pass `--help` for the full list.
 | `--rollback` | _(empty)_ | Undo cameras-table changes and exit. Values: `third_party`, `first_party`, `all`. |
 | `--protect_url` | `http://localhost:7080` | Base URL for the local Protect API used to trigger automations on smart detection events. |
 | `--protect_user_id` | _(auto-discovered)_ | X-UserId header for Protect API auth bypass. Auto-discovered from unifi-core DB on first run and cached to `/root/.config/onvif-recorder-api-key`. Pass explicitly to override. |
+| `--msr_url` | _(empty = disabled)_ | Base URL for the local UniFi Media Server Recording (MSR) gRPC service, e.g. `http://127.0.0.1:7700`. When set, detection thumbnails are forwarded via `RecordingAPI.StoreSnapshots` so MSR persists them as native UBV files owned by `ms:unifi-streaming`, making third-party thumbnails indistinguishable from first-party camera thumbnails. |
 | `--patch_alarm_picker` | `true` | Live-patch the Protect UI to allow third-party cameras in the alarm creation picker. Re-applied on every startup so it survives firmware updates. |
 
 Logging uses absl/log. `--verbose` calls `absl::SetMinLogLevel(kInfo)`; default is `kError`.

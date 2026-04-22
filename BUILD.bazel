@@ -138,6 +138,29 @@ cc_library(
 )
 
 cc_library(
+    name = "msr_client",
+    srcs = ["src/msr_client.cpp"],
+    hdrs = ["src/msr_client.hpp"],
+    strip_include_prefix = "src",
+    deps = [
+        "@com_google_absl//absl/log:log",
+    ] + _CURL,
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "msr_backfill",
+    srcs = ["src/msr_backfill.cpp"],
+    hdrs = ["src/msr_backfill.hpp"],
+    strip_include_prefix = "src",
+    deps = [
+        ":msr_client",
+        "@com_google_absl//absl/log:log",
+    ] + _PQ,
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
     name = "alarm_notifier",
     srcs = ["src/alarm_notifier.cpp"],
     hdrs = ["src/alarm_notifier.hpp"],
@@ -157,6 +180,7 @@ cc_library(
     deps = [
         ":alarm_notifier",
         ":jpeg_crop",
+        ":msr_client",
         ":object_detect",
         ":onvif_listener",
         ":ubv_thumbnail",
@@ -237,6 +261,8 @@ cc_binary(
         ":log_ring",
         ":log_server",
         ":motion_poller",
+        ":msr_backfill",
+        ":msr_client",
         ":object_detect",
         ":onvif_listener",
         ":protect_ui_patch",

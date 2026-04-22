@@ -33,6 +33,7 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <thread>  // NOLINT(build/c++11)
 #include <utility>
 #include <vector>
 
@@ -45,6 +46,8 @@
 #include "absl/status/statusor.h"
 #include "absl/log/log_sink_registry.h"
 #include "alarm_notifier.hpp"
+#include "msr_backfill.hpp"
+#include "msr_client.hpp"
 #include "camera_change_log.hpp"
 #include "detection_recorder.hpp"
 #include "event_recorder.hpp"
@@ -96,6 +99,26 @@ ABSL_FLAG(std::string, raw_log, "",
 ABSL_FLAG(std::string, protect_url, "http://localhost:7080",
     "Base URL for the local Protect API used to trigger automations "
     "(e.g. 'Make Sound for detection') on smart detection events.");
+ABSL_FLAG(std::string, msr_url, "",
+    "Base URL for the local UniFi Media Server Recording (MSR) gRPC "
+    "service, e.g. 'http://127.0.0.1:7700'.  When set, detection "
+    "thumbnails are forwarded via RecordingAPI.StoreSnapshots so that "
+    "MSR stores them as native UBV files owned by ms:unifi-streaming — "
+    "making third-party thumbnails indistinguishable from first-party "
+    "camera thumbnails in the Protect UI.  Empty (default) disables.");
+ABSL_FLAG(int32_t, backfill_msr_thumbnails, 60,
+    "Migrate pre-MSR third-party thumbnails from the `thumbnails` table "
+    "into native MSR-backed storage by re-uploading each JPEG via "
+    "MsrClient::StoreSnapshot and updating events.thumbnailId + "
+    "smartDetectObjects.thumbnailId.  Value is the lookback window in "
+    "days; 0 disables.  Runs on every startup as a background thread "
+    "when --msr_url is set; the query is self-filtering on "
+    "LENGTH(thumbnailId)=24, so once the migration is complete, "
+    "subsequent startups are effectively a no-op (~16 orphan rows "
+    "checked against the thumbnails table, no MSR uploads).");
+ABSL_FLAG(bool, backfill_apply, true,
+    "When false, --backfill_msr_thumbnails runs as a dry run "
+    "(no MSR uploads, no DB writes).  Default true.");
 ABSL_FLAG(std::string, protect_user_id, "",
     "X-UserId header value for Protect API auth bypass from localhost. "
     "Obtain with: psql -h /run/postgresql -p 5432 -d unifi-core "
@@ -477,19 +500,13 @@ int main(int argc, char* argv[]) {
   if (!thumbs_dir.empty())
     det_rec.set_ubv_dir(thumbs_dir);
 
-  // Detect native thumbnail ID format (MSR "{MAC}-{ts}" vs 24-char hex).
-  bool use_msr_thumb_ids = false;
-  {
-    auto msr_or = unifi::detect_native_msr_thumbnail_format(cam_db);
-    if (msr_or.ok()) {
-      use_msr_thumb_ids = *msr_or;
-    } else {
-      LOG(WARNING) << "Could not detect native thumbnail format: "
-                   << msr_or.status().message()
-                   << "; defaulting to 24-char DB IDs";
-    }
-    det_rec.set_use_msr_thumbnail_ids(use_msr_thumb_ids);
-  }
+  // Always use 24-char hex IDs.  MSR builds its thumbnail index from
+  // frames it writes itself; a UBV file dropped on disk is invisible to
+  // it, so non-24-char IDs route to MSR TCP and fail with error 414.
+  // 24-char hex IDs route to the thumbnails DB table, which we populate
+  // directly and which works on all Protect versions.
+  const bool use_msr_thumb_ids = false;
+  det_rec.set_use_msr_thumbnail_ids(use_msr_thumb_ids);
 
   // ----------------------------------------------------------------
   // Load third-party cameras from the UniFi Protect database.
@@ -659,6 +676,36 @@ int main(int argc, char* argv[]) {
   if (motion_poller && alarm_notifier)
     motion_poller->set_alarm_notifier(alarm_notifier.get());
 
+  // MsrClient: forwards thumbnails to MSR so Protect serves them via MSP TCP.
+  std::unique_ptr<onvif::MsrClient> msr_client;
+  {
+    const std::string msr_url = absl::GetFlag(FLAGS_msr_url);
+    if (!msr_url.empty()) {
+      msr_client = std::make_unique<onvif::MsrClient>(msr_url);
+      det_rec.set_msr_client(msr_client.get());
+      LOG(INFO) << "[msr] StoreSnapshots forwarding enabled: " << msr_url;
+    }
+  }
+
+  // Backfill pre-MSR third-party thumbnails in the background.  Runs on
+  // every startup when --msr_url is set; the SQL candidate query filters
+  // on LENGTH(thumbnailId)=24, so it becomes a cheap no-op once all
+  // eligible events have been migrated.  A background thread keeps the
+  // event loop responsive while the migration runs.
+  std::thread backfill_thread;
+  {
+    const int  days  = absl::GetFlag(FLAGS_backfill_msr_thumbnails);
+    const bool apply = absl::GetFlag(FLAGS_backfill_apply);
+    if (days > 0 && msr_client) {
+      onvif::MsrClient* msr_ptr = msr_client.get();
+      backfill_thread = std::thread([db_conn, msr_ptr, days, apply]() {
+        onvif::msr_backfill::run(db_conn, msr_ptr, days, apply);
+      });
+    } else if (days > 0 && apply) {
+      LOG(INFO) << "[backfill] skipped: --msr_url not set";
+    }
+  }
+
   // Optional startup coalescing: merge nearby events already in the database.
   // Purge stuck-open events (end IS NULL older than 5 minutes) left behind
   // by a previous crash or rapid-fire "started" bursts from cameras.
@@ -708,6 +755,8 @@ int main(int argc, char* argv[]) {
   // Clean shutdown.
   if (motion_poller)
     motion_poller->stop();
+  if (backfill_thread.joinable())
+    backfill_thread.join();
   g_poller   = nullptr;
   g_listener = nullptr;
   onvif::global_cleanup();

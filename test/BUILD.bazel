@@ -234,6 +234,14 @@ cc_test(
 )
 
 cc_test(
+    name = "test_msr_client",
+    srcs = ["test_msr_client.cpp"],
+    deps = [
+        "//:msr_client",
+    ],
+)
+
+cc_test(
     name = "test_motion_poller",
     srcs = ["test_motion_poller.cpp"],
     linkstatic = True,

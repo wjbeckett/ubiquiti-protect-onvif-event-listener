@@ -31,6 +31,7 @@
 namespace onvif {
 
 class AlarmNotifier;  // forward declaration; full definition in alarm_notifier.hpp
+class MsrClient;      // forward declaration; full definition in msr_client.hpp
 
 /**
  * DetectionRecorder
@@ -230,6 +231,15 @@ class DetectionRecorder {
   /// thumbnails table and UBV files.  Must be called before run().
   void set_use_msr_thumbnail_ids(bool use_msr);
 
+  /// Attach an MsrClient used to store third-party thumbnails via the MSR
+  /// gRPC service (RecordingAPI.StoreSnapshots).  When set and the camera
+  /// has a known MAC, the detection snapshot is forwarded to MSR, the
+  /// returned native id replaces the local thumbnail id, and the
+  /// DB `thumbnails` insert + UBV file write are skipped — the resulting
+  /// thumbnail is indistinguishable from first-party Protect thumbnails.
+  /// Must be called before run().  The client must outlive the recorder.
+  void set_msr_client(MsrClient* msr);
+
   // Defined in detection_recorder.cpp -- public so concrete backends in the
   // .cpp translation unit can inherit from it without friendship.
   struct IDbBackend {
@@ -421,6 +431,9 @@ class DetectionRecorder {
 
   // Optional alarm notifier. Set before run(); non-owning raw pointer.
   AlarmNotifier* alarm_notifier_{nullptr};
+
+  // Optional MSR gRPC client. Set before run(); non-owning raw pointer.
+  MsrClient* msr_client_{nullptr};
 
   // Object type for generic motion events (CellMotionDetector, MotionAlarm).
   std::string default_object_type_{"person"};
