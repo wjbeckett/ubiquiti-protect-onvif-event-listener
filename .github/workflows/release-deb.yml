@@ -34,7 +34,7 @@ jobs:
 
       - name: Install Bazel
         run: |
-          curl -fsSL -o /usr/local/bin/bazel \
+          sudo curl -fsSL -o /usr/local/bin/bazel \
             https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64
           sudo chmod +x /usr/local/bin/bazel
 
@@ -66,15 +66,13 @@ jobs:
           VERSION=$(git describe --tags --dirty 2>/dev/null | sed 's/^v//')
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Upload assets to release
+      - name: Upload .deb to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ github.event.inputs.tag || github.ref_name }}"
           gh release upload "$TAG" \
             dist/onvif-recorder_${{ steps.ver.outputs.version }}_arm64.deb \
-            onvif_recorder_arm64 \
-            onvif-recorder.service \
             --clobber
 
       - name: Import GPG signing key

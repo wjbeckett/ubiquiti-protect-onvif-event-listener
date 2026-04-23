@@ -18,46 +18,46 @@ public static class InstallScripts {
 
     public static string BuildInstallScript(string channel) {
         ValidateChannel(channel);
-        return $"""
+        return $$"""
             set -e
             export DEBIAN_FRONTEND=noninteractive
 
             mkdir -p /usr/share/keyrings
-            curl -fsSL {RepoUrl}/onvif-recorder.gpg -o /tmp/onvif-recorder.gpg
-            gpg --dearmor < /tmp/onvif-recorder.gpg > {Keyring}
-            chmod 0644 {Keyring}
+            curl -fsSL {{RepoUrl}}/onvif-recorder.gpg -o /tmp/onvif-recorder.gpg
+            gpg --dearmor < /tmp/onvif-recorder.gpg > {{Keyring}}
+            chmod 0644 {{Keyring}}
             rm -f /tmp/onvif-recorder.gpg
 
             mkdir -p /etc/onvif-recorder
-            echo "{channel}" > {ChannelFile}
+            echo "{{channel}}" > {{ChannelFile}}
 
-            echo "deb [arch=arm64 signed-by={Keyring}] {RepoUrl} {channel} main" \
-              > {SourcesFile}
+            echo "deb [arch=arm64 signed-by={{Keyring}}] {{RepoUrl}} {{channel}} main" \
+              > {{SourcesFile}}
 
             apt-get update \
-              -o Dir::Etc::sourcelist={SourcesFile} \
+              -o Dir::Etc::sourcelist={{SourcesFile}} \
               -o Dir::Etc::sourceparts=- \
               -o APT::Get::List-Cleanup=0
 
             apt-get install -y onvif-recorder
 
-            dpkg-query -W -f='${{Version}}' onvif-recorder
+            dpkg-query -W -f='${Version}' onvif-recorder
             """;
     }
 
     public static string BuildUpgradeScript() {
-        return $"""
+        return $$"""
             set -e
             export DEBIAN_FRONTEND=noninteractive
 
             apt-get update \
-              -o Dir::Etc::sourcelist={SourcesFile} \
+              -o Dir::Etc::sourcelist={{SourcesFile}} \
               -o Dir::Etc::sourceparts=- \
               -o APT::Get::List-Cleanup=0
 
             apt-get install -y --only-upgrade onvif-recorder
 
-            dpkg-query -W -f='${{Version}}' onvif-recorder
+            dpkg-query -W -f='${Version}' onvif-recorder
             """;
     }
 
