@@ -45,6 +45,13 @@ jobs:
           curl -fL -o nanodet_m.bin \
             https://github.com/nihui/ncnn-assets/raw/refs/heads/master/models/nanodet_m.bin
 
+      - name: Compute version
+        id: ver
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
       - name: Build ARM64 release binary
         run: |
           scripts/bz build --config=arm64_release //:onvif_recorder
@@ -53,18 +60,14 @@ jobs:
 
       - name: Build .deb
         run: |
-          scripts/build-deb.sh --arch=arm64 --binary=onvif_recorder_arm64
+          scripts/build-deb.sh --arch=arm64 \
+            --binary=onvif_recorder_arm64 \
+            --version=${{ steps.ver.outputs.version }}
 
       - name: Lint .deb
         run: |
           lintian --fail-on error --no-tag-display-limit \
             dist/onvif-recorder_*_arm64.deb
-
-      - name: Compute version
-        id: ver
-        run: |
-          VERSION=$(git describe --tags --dirty 2>/dev/null | sed 's/^v//')
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Upload .deb to release
         env:

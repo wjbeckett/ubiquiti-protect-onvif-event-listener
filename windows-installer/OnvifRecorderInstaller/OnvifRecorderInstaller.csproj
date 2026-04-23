@@ -20,6 +20,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="OnvifRecorderInstaller.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <None Update="Assets\icon.ico" Condition="Exists('Assets\icon.ico')">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
