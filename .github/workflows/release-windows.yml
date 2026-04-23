@@ -1,0 +1,72 @@
+name: Release Windows installer
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build (e.g. v1.5.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore
+        run: dotnet restore windows-installer/OnvifRecorderInstaller.sln
+
+      - name: Build
+        run: dotnet build windows-installer/OnvifRecorderInstaller.sln -c Release --no-restore
+
+      - name: Test
+        run: dotnet test windows-installer/OnvifRecorderInstaller.Tests/OnvifRecorderInstaller.Tests.csproj -c Release --no-build --verbosity normal
+
+      - name: Publish self-contained single-file exe
+        run: >
+          dotnet publish windows-installer/OnvifRecorderInstaller/OnvifRecorderInstaller.csproj
+          -c Release
+          -r win-x64
+          --self-contained
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -p:PublishTrimmed=false
+          -o publish-out
+
+      - name: Compute version
+        id: ver
+        shell: bash
+        run: |
+          VERSION=$(git describe --tags --dirty 2>/dev/null | sed 's/^v//')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Rename asset
+        shell: bash
+        run: |
+          mv "publish-out/OnvifRecorderInstaller.exe" \
+             "publish-out/OnvifRecorderInstaller-v${{ steps.ver.outputs.version }}.exe"
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          gh release upload "$TAG" \
+            "publish-out/OnvifRecorderInstaller-v${{ steps.ver.outputs.version }}.exe" \
+            --clobber

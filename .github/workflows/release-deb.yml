@@ -1,0 +1,111 @@
+name: Release .deb
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to build (e.g. v1.5.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-deb:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang cmake ninja-build perl lld nasm \
+            python3-pip curl git dpkg-dev fakeroot xz-utils qemu-user-static \
+            binutils-aarch64-linux-gnu reprepro gnupg lintian
+          pip3 install --break-system-packages cpplint
+
+      - name: Install Bazel
+        run: |
+          curl -fsSL -o /usr/local/bin/bazel \
+            https://github.com/bazelbuild/bazelisk/releases/latest/download/bazelisk-linux-amd64
+          sudo chmod +x /usr/local/bin/bazel
+
+      - name: Fetch NanoDet-M model files
+        run: |
+          curl -fL -o nanodet_m.param \
+            https://github.com/nihui/ncnn-assets/raw/refs/heads/master/models/nanodet_m.param
+          curl -fL -o nanodet_m.bin \
+            https://github.com/nihui/ncnn-assets/raw/refs/heads/master/models/nanodet_m.bin
+
+      - name: Build ARM64 release binary
+        run: |
+          scripts/bz build --config=arm64_release //:onvif_recorder
+          cp ~/.cache/bazel/arm64_release/execroot/_main/bazel-out/k8-fastbuild/bin/onvif_recorder \
+             onvif_recorder_arm64
+
+      - name: Build .deb
+        run: |
+          scripts/build-deb.sh --arch=arm64 --binary=onvif_recorder_arm64
+
+      - name: Lint .deb
+        run: |
+          lintian --fail-on error --no-tag-display-limit \
+            dist/onvif-recorder_*_arm64.deb
+
+      - name: Compute version
+        id: ver
+        run: |
+          VERSION=$(git describe --tags --dirty 2>/dev/null | sed 's/^v//')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Upload assets to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          gh release upload "$TAG" \
+            dist/onvif-recorder_${{ steps.ver.outputs.version }}_arm64.deb \
+            onvif_recorder_arm64 \
+            onvif-recorder.service \
+            --clobber
+
+      - name: Import GPG signing key
+        env:
+          GPG_SIGNING_KEY: ${{ secrets.GPG_SIGNING_KEY }}
+        run: |
+          if [ -z "${GPG_SIGNING_KEY}" ]; then
+            echo "GPG_SIGNING_KEY not set — skipping apt-repo publish"
+            exit 0
+          fi
+          echo "${GPG_SIGNING_KEY}" | gpg --batch --import
+          KEYID=$(gpg --list-secret-keys --with-colons | awk -F: '/^sec:/ {print $5; exit}')
+          echo "GPG_KEYID=$KEYID" >> "$GITHUB_ENV"
+
+      - name: Publish to gh-pages apt repo (early-access)
+        if: env.GPG_KEYID != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "onvif-recorder-release-bot"
+          git config user.email "noreply@github.com"
+          git worktree add /tmp/gh-pages gh-pages || \
+            (git fetch origin gh-pages && git worktree add /tmp/gh-pages gh-pages)
+          cd /tmp/gh-pages
+          mkdir -p conf
+          if [ ! -f conf/distributions ]; then
+            echo "ERROR: gh-pages/conf/distributions missing — bootstrap the repo first." >&2
+            exit 1
+          fi
+          reprepro --basedir . --outdir . includedeb early-access \
+            "$GITHUB_WORKSPACE/dist/onvif-recorder_${{ steps.ver.outputs.version }}_arm64.deb"
+          git add -A
+          git commit -m "Publish onvif-recorder ${{ steps.ver.outputs.version }} to early-access"
+          git push origin gh-pages

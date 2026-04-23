@@ -1,0 +1,55 @@
+name: Promote apt suite
+
+on:
+  workflow_dispatch:
+    inputs:
+      from:
+        description: 'Source suite'
+        required: true
+        type: choice
+        options: [early-access, rc]
+        default: early-access
+      to:
+        description: 'Destination suite'
+        required: true
+        type: choice
+        options: [rc, stable]
+        default: rc
+      version:
+        description: 'Package version to promote (e.g. 1.5.0)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  promote:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install reprepro + gpg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends reprepro gnupg
+
+      - name: Import GPG signing key
+        env:
+          GPG_SIGNING_KEY: ${{ secrets.GPG_SIGNING_KEY }}
+        run: |
+          echo "${GPG_SIGNING_KEY}" | gpg --batch --import
+
+      - name: Checkout gh-pages
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: apt
+
+      - name: Promote
+        run: |
+          git -C apt config user.name "onvif-recorder-release-bot"
+          git -C apt config user.email "noreply@github.com"
+          cd apt
+          reprepro --basedir . --outdir . copy "${{ inputs.to }}" "${{ inputs.from }}" \
+            onvif-recorder "${{ inputs.version }}"
+          git add -A
+          git commit -m "Promote onvif-recorder ${{ inputs.version }}: ${{ inputs.from }} -> ${{ inputs.to }}"
+          git push origin gh-pages
