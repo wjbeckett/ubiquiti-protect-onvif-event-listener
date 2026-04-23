@@ -58,7 +58,7 @@ public sealed class SshService {
                 var stdout = await Task.Run(() => cmd.Execute(), ct)
                                        .ConfigureAwait(false);
                 return new RunResult {
-                    ExitStatus = cmd.ExitStatus,
+                    ExitStatus = cmd.ExitStatus ?? -1,
                     Stdout = stdout,
                     Stderr = cmd.Error,
                 };
@@ -97,7 +97,7 @@ public sealed class SshService {
                 while (DrainOnce(outReader, onLine)) { }
                 while (DrainOnce(errReader, onLine)) { }
                 cmd.EndExecute(handle);
-                return cmd.ExitStatus;
+                return cmd.ExitStatus ?? -1;
             } finally {
                 client.Disconnect();
             }
