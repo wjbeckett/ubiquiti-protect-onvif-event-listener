@@ -13,56 +13,98 @@ AI** (e.g. G3 Instant). See [First-party camera support](#first-party-camera-sup
 
 ## Installation on Dream Router / Dream Machine
 
-### Step 1 — Enable SSH on your UniFi device
+### Windows installer (no terminal required)
 
-Go to **UniFi OS → System → Advanced** and enable SSH.
-Full instructions: https://help.ui.com/hc/en-us/articles/204909374
+If you're on Windows and don't want to touch SSH directly, download the
+latest `OnvifRecorderInstaller-v*.exe` from
+[Releases](https://github.com/danielwoz/ubiquiti-protect-onvif-event-listener/releases)
+and run it. The GUI:
 
-### Step 2 — Download the latest release
+1. Walks you through enabling SSH on your router
+   (**UniFi OS → System → Advanced → SSH**).
+2. Tests the connection with the root password you set.
+3. Adds the apt repository + installs the package, streaming progress live.
+4. Saves the credentials (password encrypted with Windows DPAPI) in
+   `HKCU\Software\OnvifRecorderInstaller` so subsequent launches offer
+   one-click upgrade, re-install, or uninstall.
 
-From your local machine, download the binary and service file from the
-[latest release](https://github.com/danielwoz/ubiquiti-protect-onvif-event-listener/releases/latest):
+The installer is unsigned, so Windows SmartScreen will prompt the first
+time — click **More info → Run anyway**.
+
+### One-line install (recommended for macOS/Linux users)
+
+SSH to your UniFi device and run:
 
 ```bash
-scp onvif_recorder_arm64 root@<router-ip>:/root/onvif_recorder
-scp onvif-recorder.service root@<router-ip>:/etc/systemd/system/
+curl -fsSL https://danielwoz.github.io/ubiquiti-protect-onvif-event-listener/install.sh | sh
 ```
 
-### Step 3 — Enable and start the service
+That's it. The installer:
 
-```bash
-chmod +x /root/onvif_recorder
-systemctl enable onvif-recorder
-systemctl start onvif-recorder
-systemctl status onvif-recorder
-```
+1. Installs the signing key to `/usr/share/keyrings/onvif-recorder-archive-keyring.gpg`.
+2. Detects your UniFi Protect release channel (Stable / Release Candidate /
+   Early Access) and configures APT to pull matching builds.
+3. `apt-get install onvif-recorder`, which auto-enables the systemd service
+   plus two daily timers: channel sync and auto-updates.
 
-Detections will appear in UniFi Protect within seconds of the first motion event.
-Service logs are written to `/var/log/onvif-recorder.log` (errors only by default).
+Detections will appear in UniFi Protect within seconds of the first motion
+event. Service logs land in journald (`journalctl -u onvif-recorder`).
 
 **What happens on first start:**
 
-1. NanoDet-M model files are **downloaded automatically** to `/root/models/` if
-   not already present.
-2. The Protect user ID is **auto-discovered** from the unifi-core database and
-   cached to `/root/.config/onvif-recorder-api-key`.
-3. The Protect UI is **live-patched** so third-party cameras appear in the alarm
-   creation picker.
+1. The Protect user ID is **auto-discovered** from the unifi-core database
+   and cached to `/var/lib/onvif-recorder/protect-user-id`.
+2. The Protect UI is **live-patched** so third-party cameras appear in the
+   alarm creation picker.
+3. nginx is patched to expose the admin UI at `https://<device>/onvif/admin/`.
 4. Third-party ONVIF cameras are loaded from the Protect database and smart
    detection flags are enabled for them.
 
 No flags are required for the default setup.
 
+### Admin UI
+
+After install, manage the package without SSH at
+`https://<device>/onvif/admin/`:
+
+- Force an update check
+- Switch release channel (stable / rc / early-access)
+- Enable / disable auto-updates and change the schedule
+- Uninstall the package
+
+### Updates
+
+Auto-updates are **on by default**. The `onvif-recorder-autoupdate.timer` runs
+daily with up to 2h random jitter; `onvif-recorder-channel.timer` keeps the
+APT suite in sync with your Protect channel. Both can be disabled via the
+admin UI or `systemctl disable --now <timer>`.
+
+### Uninstall
+
+```bash
+apt-get remove onvif-recorder          # stops service, rolls back DB changes
+apt-get purge  onvif-recorder          # also removes /etc/onvif-recorder and state
+```
+
+### Legacy install (deprecated)
+
+Prior releases shipped as a raw binary at `/root/onvif_recorder`. The `.deb`
+postinst migrates an existing manual install automatically on first upgrade —
+no action required.
+
 ---
 
 ## Configuration flags
 
-All options are set via command-line flags. To change a flag, edit the service
-file and append flags to the `ExecStart` line:
+All options are set via command-line flags. To change a flag, edit the
+service file's `ExecStart` line (usually via a systemd drop-in):
 
 ```bash
-# Example: enable verbose logging and always use NanoDet-M for cropping
-ExecStart=/root/onvif_recorder --verbose --detect_override
+# systemctl edit onvif-recorder.service
+# then add (or amend) an [Service] section:
+[Service]
+ExecStart=
+ExecStart=/usr/bin/onvif-recorder --verbose --detect_override
 ```
 
 ```bash
@@ -102,7 +144,7 @@ regardless of what the camera reports.
 
 **Example — wildlife camera on `.108` and package camera on `.109`:**
 ```bash
-ExecStart=/root/onvif_recorder \
+ExecStart=/usr/bin/onvif-recorder \
   --camera_object_types=192.168.1.108=animal,192.168.1.109=package
 ```
 
@@ -136,7 +178,7 @@ unlock door, light, PTZ preset) configured in **Protect → Alarms**.
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--protect_url` | `http://localhost:7080` | Base URL for the local Protect API. Only change this if running off-device. |
-| `--protect_user_id` | _(auto-discovered)_ | Protect user ID for API auth. Auto-discovered from unifi-core DB and cached to `/root/.config/onvif-recorder-api-key`. Pass explicitly to override. |
+| `--protect_user_id` | _(auto-discovered)_ | Protect user ID for API auth. Auto-discovered from the unifi-core DB and cached to `/var/lib/onvif-recorder/protect-user-id`. Pass explicitly to override. |
 | `--patch_alarm_picker` | `true` | Live-patch the Protect UI so third-party cameras appear in the alarm creation picker. |
 
 ---
@@ -155,7 +197,7 @@ not present in `--model_dir`.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--model_dir` | `/root/models` | Directory for NanoDet-M model files. Created automatically if needed. |
+| `--model_dir` | `/usr/share/onvif-recorder/models` | Directory for NanoDet-M model files. Shipped inside the .deb. |
 | `--detect` | `true` | Run NanoDet-M as fallback when the camera provides no ONVIF bounding box. |
 | `--detect_override` | `false` | Always run NanoDet-M, ignoring any ONVIF bounding box. Implies `--detect`. |
 
@@ -213,7 +255,7 @@ ORDER BY name;
 
 **Example — enable G3 Instant smart detection with UI support:**
 ```bash
-ExecStart=/root/onvif_recorder --detect_override \
+ExecStart=/usr/bin/onvif-recorder --detect_override \
   --first_party_cameras=6713fe0a01583d03e400051c,6713fa9e023c3d03e4000451
 ```
 
@@ -236,12 +278,14 @@ best-effort reset.
 
 **Example — enable change logging:**
 ```bash
-ExecStart=/root/onvif_recorder --change_log=/root/cam_changes.jsonl
+ExecStart=/usr/bin/onvif-recorder \
+  --change_log=/var/lib/onvif-recorder/cam_changes.jsonl
 ```
 
 **Example — rollback all changes and exit:**
 ```bash
-/root/onvif_recorder --rollback=all --change_log=/root/cam_changes.jsonl
+/usr/bin/onvif-recorder --rollback=all \
+  --change_log=/var/lib/onvif-recorder/cam_changes.jsonl
 ```
 
 ---
@@ -270,18 +314,18 @@ ExecStart=/root/onvif_recorder --change_log=/root/cam_changes.jsonl
 
 **Check the log for errors:**
 ```bash
-tail -f /var/log/onvif-recorder.log
+journalctl -u onvif-recorder -f
 ```
 
 **Enable verbose output** to see per-camera lifecycle events:
 ```bash
 systemctl stop onvif-recorder
-/root/onvif_recorder --verbose
+/usr/bin/onvif-recorder --verbose
 ```
 
 **Camera not working?** Capture a raw diagnostic log and open a GitHub issue:
 ```bash
-/root/onvif_recorder --verbose --raw_log=/tmp/onvif-raw.jsonl
+/usr/bin/onvif-recorder --verbose --raw_log=/tmp/onvif-raw.jsonl
 # Let it run 60+ seconds, then Ctrl+C
 # Attach /tmp/onvif-raw.jsonl to your issue
 ```

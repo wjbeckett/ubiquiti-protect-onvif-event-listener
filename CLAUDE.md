@@ -214,6 +214,27 @@ scripts/bz test --config=x86 //test:all
 
 - `onvif_recorder_arm64` — ARM64 release binary (PGO + ThinLTO) built at the tagged commit
 - `onvif-recorder.service` — systemd service file (in the repo root)
+- `onvif-recorder_<ver>_arm64.deb` — Debian package built via `scripts/build-deb.sh --arch=arm64`.
+- `OnvifRecorderInstaller-v<ver>.exe` — Windows installer (self-contained win-x64 single-file exe).
+
+The `release-deb.yml` GitHub Actions workflow builds the `.deb`, uploads it
+to the release, and publishes to the `early-access` suite of the gh-pages
+apt repo automatically on every `v*` tag push.
+
+The `release-windows.yml` workflow builds and uploads the Windows installer
+on the same `v*` tag push (runs on `windows-2022`, publishes a self-contained
+.NET 8 WPF single-file exe).
+
+Keep the raw binary + service file as assets for 2–3 releases during the
+legacy-install transition.
+
+### APT suite promotion
+
+Releases land in `early-access` first. Promote manually via the `promote.yml`
+workflow (Actions → Promote apt suite → Run workflow):
+
+- `early-access` → `rc` once the release has been exercised on a dev device
+- `rc` → `stable` after wider testing
 
 ### Required release notes
 
@@ -280,7 +301,10 @@ All configuration is now via `absl::flags`. Pass `--help` for the full list.
 | `--verbose` | `false` | Set absl log level to INFO (lifecycle, events, renewals). Default: ERROR only |
 | `--event_log` | _(disabled)_ | Path for parsed-event JSON Lines log; one line per ONVIF event |
 | `--raw_log` | _(disabled)_ | Path for raw SOAP exchange JSON Lines log; one line per HTTP request/response |
-| `--model_dir` | `/root/models` | Directory containing `nanodet_m.param` and `nanodet_m.bin`. Models are downloaded automatically if not present. |
+| `--model_dir` | `/usr/share/onvif-recorder/models` | Directory containing `nanodet_m.param` and `nanodet_m.bin`. Shipped inside the .deb; models are downloaded at runtime if not present. |
+| `--state_dir` | `/var/lib/onvif-recorder` | Directory for runtime state (API-key cache, future per-host state). Defense-in-depth fallback: if the default is used and the legacy `/root/.config/onvif-recorder-api-key` exists, it is copied here on first run. |
+| `--admin_port` | `7891` | localhost HTTP port serving the admin UI. Reached externally via the nginx-patched `https://<device>/onvif/admin/`. |
+| `--channel_file` | `/etc/onvif-recorder/channel` | File containing the selected APT channel (`stable` / `rc` / `early-access`). Read by the admin UI and the `onvif-recorder-channel.service` oneshot. |
 | `--detect` | `true` | Enable NanoDet-M as fallback when the camera provides no ONVIF bbox |
 | `--detect_override` | `false` | Always run NanoDet-M, ignoring the ONVIF bbox entirely (implies `--detect`) |
 | `--coalesce_window_sec` | `30` | Merge consecutive detections from the same camera into one event if the new detection starts within this many seconds of the previous one ending. Set to 0 to disable. |
@@ -293,7 +317,7 @@ All configuration is now via `absl::flags`. Pass `--help` for the full list.
 | `--change_log` | _(empty)_ | Path for cameras-table change log (JSON Lines). Records old/new values for rollback. |
 | `--rollback` | _(empty)_ | Undo cameras-table changes and exit. Values: `third_party`, `first_party`, `all`. |
 | `--protect_url` | `http://localhost:7080` | Base URL for the local Protect API used to trigger automations on smart detection events. |
-| `--protect_user_id` | _(auto-discovered)_ | X-UserId header for Protect API auth bypass. Auto-discovered from unifi-core DB on first run and cached to `/root/.config/onvif-recorder-api-key`. Pass explicitly to override. |
+| `--protect_user_id` | _(auto-discovered)_ | X-UserId header for Protect API auth bypass. Auto-discovered from unifi-core DB on first run and cached to `<state_dir>/protect-user-id`. Pass explicitly to override. |
 | `--msr_url` | `http://127.0.0.1:7700` | Base URL for the local UniFi Media Server Recording (MSR) gRPC service. Detection thumbnails are forwarded via `RecordingAPI.StoreSnapshots` so MSR persists them as native UBV files owned by `ms:unifi-streaming`, making third-party thumbnails indistinguishable from first-party. Set to empty string to disable. |
 | `--patch_alarm_picker` | `true` | Live-patch the Protect UI to allow third-party cameras in the alarm creation picker. Re-applied on every startup so it survives firmware updates. |
 
@@ -342,47 +366,46 @@ cp nanodet_m.param nanodet_m.bin ~/models/
 
 ### Deploying the model to a Dream Router / NVR
 
-NCNN is now built from source for ARM64 (with NEON SIMD).  After copying the
-binary to the router, copy the model files too:
+The `.deb` ships the NanoDet-M model files to
+`/usr/share/onvif-recorder/models` and sets `--model_dir` to that path, so
+no model-deploy step is needed on a package install.
+
+Only required for the deprecated manual deploy below: copy the two files
+yourself and point `--model_dir` at them:
 
 ```bash
-# Copy model files to the router
 ssh root@<router-ip> "mkdir -p /root/models"
 scp nanodet_m.param nanodet_m.bin root@<router-ip>:/root/models/
-```
-
-Then update the service file to pass `--model_dir` (and `--detect` or
-`--detect_override`) to the recorder:
-
-```ini
-[Service]
-ExecStart=/root/onvif_recorder --detect --model_dir=/root/models
-```
-
-Reload and restart after editing the service file:
-
-```bash
+# then in the systemd unit:
+#   ExecStart=/root/onvif_recorder --detect --model_dir=/root/models
 ssh root@<router-ip> "systemctl daemon-reload && systemctl restart onvif-recorder"
 ```
 
 ## Deploying to a Dream Router / NVR
 
+Recommended: use the apt repo (one-line installer). For dev builds of an
+unreleased commit:
+
 ```bash
-# 1. Cross-compile for ARM64 (PGO + ThinLTO optimised release)
-scripts/bz build --config=arm64_release //:onvif_recorder
+# 1. Build the .deb (ARM64 release + PGO + LTO + dpkg-deb)
+./build-in-docker.sh --deb
 
-# 2. Copy binary to router (replace <router-ip> with your device's IP)
-scp bazel-bin/onvif_recorder root@<router-ip>:/root/onvif_recorder
-
-# 3. Copy (or update) the systemd service file
-scp onvif-recorder.service root@<router-ip>:/etc/systemd/system/onvif-recorder.service
-
-# 4. Reload systemd and restart the service on the router
-ssh root@<router-ip> "systemctl daemon-reload && systemctl restart onvif-recorder"
-
-# 5. Verify it is running
-ssh root@<router-ip> "systemctl status onvif-recorder"
+# 2. Copy + install
+scp dist/onvif-recorder_*_arm64.deb root@<router-ip>:/tmp/
+ssh root@<router-ip> "apt-get install -y /tmp/onvif-recorder_*_arm64.deb"
 ```
 
-The binary lives at `/root/onvif_recorder` and the service file at
-`/etc/systemd/system/onvif-recorder.service` on UniFi Dream Routers and NVRs.
+The .deb installs to `/usr/bin/onvif-recorder`, registers the systemd unit
+under `/lib/systemd/system/`, and enables the service + the two daily timers
+(channel sync + auto-update). Logs go to journald:
+`journalctl -u onvif-recorder`.
+
+### Legacy manual deploy (deprecated)
+
+```bash
+scripts/bz build --config=arm64_release //:onvif_recorder
+scp ~/.cache/bazel/arm64_release/execroot/_main/bazel-out/k8-fastbuild/bin/onvif_recorder \
+    root@<router-ip>:/root/onvif_recorder
+scp onvif-recorder.service root@<router-ip>:/etc/systemd/system/
+ssh root@<router-ip> "systemctl daemon-reload && systemctl restart onvif-recorder"
+```

@@ -195,6 +195,16 @@ then verified with `gh release view`.
 ### Required release assets
 - `onvif_recorder_arm64` — ARM64 release binary (PGO + ThinLTO) built at the tagged commit
 - `onvif-recorder.service` — systemd service file
+- `onvif-recorder_<ver>_arm64.deb` — Debian package (built via `scripts/build-deb.sh` or `./build-in-docker.sh --deb`)
+- `OnvifRecorderInstaller-v<ver>.exe` — Windows installer (self-contained win-x64)
+
+The `release-deb.yml` workflow attaches the `.deb` automatically and publishes
+it to the `early-access` suite of the gh-pages apt repo. Promotion to `rc` and
+`stable` is manual (`promote.yml`).
+
+The `release-windows.yml` workflow attaches the `.exe` automatically on the
+same `v*` tag (builds on `windows-2022`, publishes a single-file .NET 8 WPF
+exe). Source lives in `windows-installer/`.
 
 ### Required release notes
 Every release must include:
