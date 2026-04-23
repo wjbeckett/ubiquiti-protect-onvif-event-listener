@@ -52,7 +52,8 @@ jobs:
         id: ver
         shell: bash
         run: |
-          VERSION=$(git describe --tags --dirty 2>/dev/null | sed 's/^v//')
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Rename asset
