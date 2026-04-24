@@ -415,6 +415,11 @@ MHD_Result handler(
     void** con_cls) {
   auto* ctx = static_cast<Ctx*>(cls);
   const bool is_post = std::strcmp(method, "POST") == 0;
+  // Treat HEAD identically to GET for dispatch; libmicrohttpd strips the
+  // body automatically on HEAD responses.  Without this, HEAD requests
+  // (used by some health-check probes and curl -I) fall through to 404.
+  const bool is_get  = std::strcmp(method, "GET") == 0 ||
+                       std::strcmp(method, "HEAD") == 0;
 
   // libmicrohttpd calls us at least twice for POST: once to begin, then for
   // each chunk of upload_data.  Accumulate into a PostCtx.
@@ -436,12 +441,12 @@ MHD_Result handler(
   std::string body;
   std::string content_type = "text/plain; charset=utf-8";
 
-  if (std::strcmp(method, "GET") == 0 &&
+  if (is_get &&
       (std::strcmp(url, "/admin/") == 0 || std::strcmp(url, "/admin") == 0 ||
        std::strcmp(url, "/") == 0)) {
     body = kAdminHtml;
     content_type = "text/html; charset=utf-8";
-  } else if (std::strcmp(method, "GET") == 0 &&
+  } else if (is_get &&
              std::strcmp(url, "/api/status") == 0) {
     body = build_status_json(*ctx);
     content_type = "application/json";
