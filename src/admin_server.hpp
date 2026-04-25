@@ -46,7 +46,9 @@ class AdminServer {
              const std::string& channel_file,
              uint16_t port = 7891,
              const std::string& config_path = "/etc/onvif-recorder/config.json",
-             const unifi::DbConfig& db = unifi::DbConfig{});
+             const unifi::DbConfig& db = unifi::DbConfig{},
+             const std::string& protect_url = "",
+             const std::string& protect_user_id = "");
 
   /// Return the port the server is listening on. Only meaningful after a
   /// successful start().  Useful when start() was called with port=0.
@@ -67,6 +69,8 @@ class AdminServer {
   std::string channel_file_;
   std::string config_path_;
   unifi::DbConfig db_;
+  std::string protect_url_;
+  std::string protect_user_id_;
   uint16_t port_{0};
 };
 

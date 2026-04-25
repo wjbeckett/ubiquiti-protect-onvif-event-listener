@@ -443,12 +443,38 @@ int main(int argc, char* argv[]) {
     LOG(WARNING) << "[log_server] failed to start on port " << log_port;
   }
 
+  // Discover the Protect API user-id early so the admin server can proxy
+  // MSR-stored thumbnails through Protect's local /api/thumbnails/<id>
+  // endpoint.  AlarmNotifier (started later) reuses the same value.
+  std::string protect_user_id = absl::GetFlag(FLAGS_protect_user_id);
+  if (protect_user_id.empty()) {
+    const std::string state_dir = absl::GetFlag(FLAGS_state_dir);
+    (void)mkdir(state_dir.c_str(), 0755);
+    const std::string cache_path = state_dir + "/protect-user-id";
+    struct stat st;
+    if (stat(cache_path.c_str(), &st) != 0) {
+      const char kLegacyPath[] = "/root/.config/onvif-recorder-api-key";
+      std::ifstream in(kLegacyPath, std::ios::binary);
+      if (in.is_open()) {
+        std::ofstream out(cache_path, std::ios::binary);
+        if (out.is_open()) {
+          out << in.rdbuf();
+          LOG(INFO) << "[alarm] migrated cache " << kLegacyPath
+                    << " -> " << cache_path;
+        }
+      }
+    }
+    protect_user_id = onvif::discover_protect_user_id(cache_path);
+  }
+
   // Start the admin page (loopback HTTP, proxied at /onvif/admin/).
   onvif::AdminServer admin_server;
   const uint16_t admin_port = absl::GetFlag(FLAGS_admin_port);
   const std::string channel_file = absl::GetFlag(FLAGS_channel_file);
   if (admin_server.start(ONVIF_RECORDER_VERSION, channel_file, admin_port,
-                         kConfigPath, cam_db)) {
+                         kConfigPath, cam_db,
+                         absl::GetFlag(FLAGS_protect_url),
+                         protect_user_id)) {
     LOG(INFO) << "[admin_server] listening on 127.0.0.1:" << admin_port;
     auto ng_a = protect_ui::patch_nginx_admin_proxy(admin_port);
     if (!ng_a.ok())
@@ -733,35 +759,8 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  // AlarmNotifier: triggers Protect automations (e.g. chime play) on detections.
-  // Auto-discover user ID if not explicitly set via flag.
-  std::string protect_user_id = absl::GetFlag(FLAGS_protect_user_id);
-  if (protect_user_id.empty()) {
-    const std::string state_dir = absl::GetFlag(FLAGS_state_dir);
-    (void)mkdir(state_dir.c_str(), 0755);
-    const std::string cache_path = state_dir + "/protect-user-id";
-
-    // Defense-in-depth: migrate from the pre-Debian-package location if the
-    // new cache file is missing but the legacy one exists.  postinst should
-    // have handled this already on package upgrade; this catches the case
-    // where the user runs the binary without going through the package.
-    struct stat st;
-    if (stat(cache_path.c_str(), &st) != 0) {
-      const char kLegacyPath[] = "/root/.config/onvif-recorder-api-key";
-      std::ifstream in(kLegacyPath, std::ios::binary);
-      if (in.is_open()) {
-        std::ofstream out(cache_path, std::ios::binary);
-        if (out.is_open()) {
-          out << in.rdbuf();
-          LOG(INFO) << "[alarm] migrated cache " << kLegacyPath
-                    << " -> " << cache_path;
-        }
-      }
-    }
-
-    protect_user_id = onvif::discover_protect_user_id(cache_path);
-  }
-
+  // AlarmNotifier: triggers Protect automations (e.g. chime play) on
+  // detections.  user-id was discovered earlier (above admin_server.start).
   std::unique_ptr<onvif::AlarmNotifier> alarm_notifier;
   if (!protect_user_id.empty()) {
     alarm_notifier = std::make_unique<onvif::AlarmNotifier>(

@@ -77,7 +77,7 @@ cc_library(
     srcs = ["src/admin_server.cpp"],
     hdrs = ["src/admin_server.hpp"],
     strip_include_prefix = "src",
-    deps = _MHD + [
+    deps = _MHD + _CURL + [
         ":dump_sanitizer",
         ":runtime_config",
         ":unifi_camera_config",

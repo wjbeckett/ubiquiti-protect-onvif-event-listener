@@ -15,6 +15,7 @@
 #include "admin_server.hpp"
 
 #include <arpa/inet.h>
+#include <curl/curl.h>
 #include <microhttpd.h>
 #include <netinet/in.h>
 
@@ -153,9 +154,9 @@ restarts the service so changes take effect immediately.</p>
 
 <div class="card"><h2>Recent events</h2>
 <p class="desc" style="font-size:12px;color:#9aa0a6;margin:0 0 8px 0">
-Last 30 events.  Thumbnail previews show only when the snapshot was
-written to Protect's <code>thumbnails</code> table; events whose
-thumbnails were forwarded to MSR show a small marker instead.</p>
+Last 30 events with their snapshot thumbnails.  Thumbnails written
+to Protect's <code>thumbnails</code> table are read directly; MSR-stored
+snapshots are proxied through Protect's local API.</p>
 <div id="recent-events-list" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:8px">Loading…</div></div>
 
 <div class="card"><h2>Diagnostics</h2>
@@ -459,13 +460,16 @@ async function loadRecentEvents(){
       return;
     }
     root.innerHTML = j.events.map(ev => {
-      const thumb = ev.thumbnail_in_db
+      const thumb = ev.thumbnail_id
         ? '<img src="api/thumbnail?id=' + encodeURIComponent(ev.thumbnail_id)
             + '" style="width:100%;height:90px;object-fit:cover;border-radius:4px;background:#0e1118" '
-            + 'onerror="this.style.display=\'none\'" loading="lazy">'
+            + 'onerror="this.replaceWith(Object.assign(document.createElement(\'div\'),'
+            + '{style:\'height:90px;display:flex;align-items:center;justify-content:center;'
+            + 'background:#0e1118;border:1px dashed #2a3140;border-radius:4px;color:#5a6172;font-size:11px\','
+            + 'textContent:\'no thumb\'}))" loading="lazy">'
         : '<div style="height:90px;display:flex;align-items:center;justify-content:center;'
             + 'background:#0e1118;border:1px dashed #2a3140;border-radius:4px;color:#5a6172;font-size:11px">'
-            + 'MSR</div>';
+            + 'no thumb</div>';
       const sdt = (ev.sdt && ev.sdt.length)
         ? ev.sdt.join(',')
         : ev.type;
@@ -523,6 +527,42 @@ std::string read_file(const std::string& path) {
   std::stringstream ss;
   ss << f.rdbuf();
   return ss.str();
+}
+
+// GET <protect_url>/api/thumbnails/<id> with X-UserId auth.  Returns the
+// JPEG bytes on 200, or an empty string on any error / non-200.  Used to
+// proxy MSR-stored thumbnails (whose IDs are length != 24 and live as
+// native UBV files served by the Protect msp media server) into the
+// admin UI's <img src="api/thumbnail?id=..."> path.
+std::string fetch_protect_thumbnail(const std::string& protect_url,
+                                     const std::string& user_id,
+                                     const std::string& thumb_id) {
+  if (protect_url.empty() || user_id.empty()) return {};
+  std::string url = protect_url + "/api/thumbnails/" + thumb_id;
+  std::string buf;
+  CURL* curl = curl_easy_init();
+  if (!curl) return {};
+  struct curl_slist* hdrs = nullptr;
+  std::string user_hdr = "X-UserId: " + user_id;
+  hdrs = curl_slist_append(hdrs, user_hdr.c_str());
+  hdrs = curl_slist_append(hdrs, "X-Source: unifi-os");
+  curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);  // NOLINT(runtime/int)
+  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);  // NOLINT(runtime/int)
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,
+      +[](char* p, size_t s, size_t n, void* ud) -> size_t {
+        static_cast<std::string*>(ud)->append(p, s * n);
+        return s * n;
+      });
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
+  CURLcode rc = curl_easy_perform(curl);
+  long code = 0;  // NOLINT(runtime/int)
+  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+  curl_slist_free_all(hdrs);
+  curl_easy_cleanup(curl);
+  if (rc != CURLE_OK || code != 200) return {};
+  return buf;
 }
 
 // Write a string atomically to a file: write to .tmp, rename.
@@ -598,6 +638,8 @@ struct Ctx {
   const char* channel_file;
   const char* config_path;
   const unifi::DbConfig* db;  // optional; may have empty conn_string
+  const char* protect_url;        // empty if Protect API not available
+  const char* protect_user_id;    // empty if no X-UserId discovered
 };
 
 // Build a JSON response body for GET /api/status.
@@ -1130,25 +1172,42 @@ MHD_Result handler(
     content_type = "application/json";
   } else if (is_get &&
              std::strncmp(url, "/api/thumbnail", 14) == 0) {
-    // /api/thumbnail?id=<thumb_id>.  Returns 404 if not in DB
-    // (MSR-stored thumbnails are not exposed via this endpoint).
+    // /api/thumbnail?id=<thumb_id>.  IDs of length 24 live in the Protect
+    // thumbnails table (read directly via libpq); other IDs are MSR-stored
+    // UBV thumbnails which we proxy through Protect's local API at
+    // <protect_url>/api/thumbnails/<id> using the cached X-UserId header.
     const char* qs = MHD_lookup_connection_value(
         connection, MHD_GET_ARGUMENT_KIND, "id");
-    if (qs == nullptr || qs[0] == '\0' || ctx->db == nullptr) {
+    if (qs == nullptr || qs[0] == '\0') {
       status = 400;
       body = "missing id";
     } else {
-      auto bytes_or = unifi::load_thumbnail_bytes(qs, *ctx->db);
-      if (!bytes_or.ok()) {
-        status = 500;
-        body = std::string(bytes_or.status().message());
-      } else if (bytes_or->empty()) {
-        status = 404;
-        body = "thumbnail not in DB (MSR-stored or unknown id)";
-      } else {
-        body.assign(reinterpret_cast<const char*>(bytes_or->data()),
-                    bytes_or->size());
-        content_type = "image/jpeg";
+      bool served = false;
+      if (ctx->db != nullptr && std::strlen(qs) == 24) {
+        auto bytes_or = unifi::load_thumbnail_bytes(qs, *ctx->db);
+        if (!bytes_or.ok()) {
+          status = 500;
+          body = std::string(bytes_or.status().message());
+          served = true;
+        } else if (!bytes_or->empty()) {
+          body.assign(reinterpret_cast<const char*>(bytes_or->data()),
+                      bytes_or->size());
+          content_type = "image/jpeg";
+          served = true;
+        }
+      }
+      if (!served) {
+        std::string jpeg = fetch_protect_thumbnail(
+            ctx->protect_url ? ctx->protect_url : "",
+            ctx->protect_user_id ? ctx->protect_user_id : "",
+            qs);
+        if (!jpeg.empty()) {
+          body = std::move(jpeg);
+          content_type = "image/jpeg";
+        } else {
+          status = 404;
+          body = "thumbnail not available";
+        }
       }
     }
   } else if (is_get &&
@@ -1215,11 +1274,15 @@ bool AdminServer::start(const std::string& version,
                         const std::string& channel_file,
                         uint16_t port,
                         const std::string& config_path,
-                        const unifi::DbConfig& db) {
+                        const unifi::DbConfig& db,
+                        const std::string& protect_url,
+                        const std::string& protect_user_id) {
   version_ = version;
   channel_file_ = channel_file;
   config_path_ = config_path;
   db_ = db;
+  protect_url_ = protect_url;
+  protect_user_id_ = protect_user_id;
 
   struct sockaddr_in addr{};
   addr.sin_family = AF_INET;
@@ -1228,7 +1291,8 @@ bool AdminServer::start(const std::string& version,
 
   // Leaked Ctx: one per server instance; lives for the program lifetime.
   auto* ctx = new Ctx{version_.c_str(), channel_file_.c_str(),
-                      config_path_.c_str(), &db_};
+                      config_path_.c_str(), &db_,
+                      protect_url_.c_str(), protect_user_id_.c_str()};
 
   daemon_ = MHD_start_daemon(
       MHD_USE_INTERNAL_POLLING_THREAD,
