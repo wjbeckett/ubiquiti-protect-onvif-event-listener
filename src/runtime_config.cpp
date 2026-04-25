@@ -74,6 +74,19 @@ const std::vector<Entry>& Schema() {
      "alone.",
      "Cameras"},
 
+    // ---- MSR forwarding ----
+    {"msr_url", Type::String,
+     "Base URL of the local MSR gRPC service.  Default works on Dream "
+     "Routers / NVRs out of the box; set to empty string to disable MSR "
+     "thumbnail forwarding (third-party thumbnails will be stored in the "
+     "DB only).",
+     "MSR forwarding"},
+    {"backfill_apply", Type::Bool,
+     "When true, the startup MSR-thumbnail backfill writes changes.  Set "
+     "to false for a dry-run that logs what would be migrated without "
+     "touching MSR or the events table.",
+     "MSR forwarding"},
+
     // ---- Logging ----
     {"verbose", Type::Bool,
      "Verbose log level (INFO and above).  Disabled by default writes only "

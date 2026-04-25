@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -86,6 +87,24 @@ load_all_nonsmartdetect_first_party(const DbConfig& db = {});
 /// Used by the admin UI to populate the first-party tickbox list.
 absl::StatusOr<std::vector<FirstPartyCamera>>  // NOLINT(whitespace/indent_namespace)
 load_all_first_party(const DbConfig& db = {});
+
+/// Aggregated health row used by the admin UI's Camera Health card.
+struct CameraHealth {
+  std::string id;
+  std::string name;
+  std::string host;        ///< IP / DNS name
+  std::string mac;
+  bool        is_third_party{false};
+  uint64_t    last_event_ms{0};   ///< 0 if never
+  uint64_t    events_1h{0};
+};
+
+/// Single-query camera health snapshot for every adopted camera (third-
+/// and first-party).  Returns rows ordered with third-party first then by
+/// name.  last_event_ms is the most recent events.start across all event
+/// types; events_1h is the count of events in the last hour.
+absl::StatusOr<std::vector<CameraHealth>>  // NOLINT(whitespace/indent_namespace)
+load_camera_health(const DbConfig& db = {});
 
 /// Search for adopted first-party cameras whose `type` column contains any
 /// of the given @p model_substrings (case-insensitive ILIKE match).

@@ -25,6 +25,7 @@ typedef int MHD_Result;
 #include <signal.h>
 #include <unistd.h>
 
+#include <chrono>  // NOLINT(build/c++11)
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -89,11 +90,28 @@ z-index:99}
 .spinner-circle{width:36px;height:36px;border:3px solid #3a4255;border-top-color:#1e6feb;
 border-radius:50%;animation:spin 1s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
+.pill{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;
+font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+.pill.green{background:#1a3a1a;color:#a0e0a0}
+.pill.amber{background:#3a2a1a;color:#e0c290}
+.pill.red{background:#3a1a1a;color:#e0a0a0}
+.pill.grey{background:#2a3140;color:#9aa0a6}
 </style></head><body>
 <h1>ONVIF Recorder</h1>
 
 <div class="card"><h2>Status</h2>
 <div class="kv" id="status">Loading…</div></div>
+
+<div class="card"><h2>Camera health</h2>
+<table id="camhealth-table" style="width:100%;border-collapse:collapse;font-size:13px">
+<thead><tr style="color:#9aa0a6;text-align:left">
+<th style="padding:4px 6px">Name</th>
+<th style="padding:4px 6px">Host</th>
+<th style="padding:4px 6px">Role</th>
+<th style="padding:4px 6px">Last event</th>
+<th style="padding:4px 6px">1h</th>
+<th style="padding:4px 6px"></th></tr></thead>
+<tbody id="camhealth-body"><tr><td colspan="6">Loading…</td></tr></tbody></table></div>
 
 <div class="card"><h2>Release channel</h2>
 <div class="row"><label>APT suite used for upgrades</label>
@@ -114,7 +132,8 @@ border-radius:50%;animation:spin 1s linear infinite}
 <div class="row"><label>Schedule (systemd OnCalendar)</label>
 <input type="text" id="autoupdate-schedule" placeholder="daily"></div>
 <div class="row"><button onclick="setAutoupdate()">Apply</button>
-<button onclick="checkNow()">Check now</button></div>
+<button onclick="checkNow()">Check now</button>
+<button onclick="refreshApt()">Refresh package list</button></div>
 <div class="msg" id="autoupdate-msg"></div></div>
 
 <div class="card"><h2>First-party cameras</h2>
@@ -130,6 +149,14 @@ restarts the service so changes take effect immediately.</p>
 <div id="config-form">Loading…</div>
 <div class="row"><button onclick="saveConfig()">Save &amp; restart</button></div>
 <div class="msg" id="config-msg"></div></div>
+
+<div class="card"><h2>Diagnostics</h2>
+<p class="desc" style="font-size:12px;color:#9aa0a6;margin:0 0 8px 0">
+Download a tar.gz of recent journal output, current config, camera-health
+snapshot, and version info.  Attach this to a GitHub issue when reporting
+problems.</p>
+<div class="row"><button onclick="downloadDump()">Download diagnostic dump</button></div>
+<div class="msg" id="dump-msg"></div></div>
 
 <div class="card"><h2>Uninstall</h2>
 <div class="row"><label>Remove onvif-recorder and all patches</label>
@@ -203,6 +230,33 @@ async function setAutoupdate(){
 async function checkNow(){
   const r = await post('api/check', {});
   msg('autoupdate-msg', r.text, r.ok);
+}
+async function refreshApt(){
+  msg('autoupdate-msg', 'Refreshing apt package list…', true);
+  const r = await post('api/refresh_apt', {});
+  msg('autoupdate-msg', r.text, r.ok);
+}
+async function downloadDump(){
+  msg('dump-msg', 'Building diagnostic archive…', true);
+  try {
+    const r = await fetch('api/diagnostic_dump');
+    if (!r.ok) {
+      msg('dump-msg', 'Failed: ' + (await r.text()), false);
+      return;
+    }
+    const blob = await r.blob();
+    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'onvif-recorder-dump-' + ts + '.tar.gz';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(a.href);
+    msg('dump-msg', 'Downloaded.', true);
+  } catch (e) {
+    msg('dump-msg', 'Failed: ' + e, false);
+  }
 }
 async function uninstall(){
   if (!confirm('Uninstall onvif-recorder? This stops the service, removes the package, and rolls back UI/nginx patches.')) return;
@@ -330,10 +384,57 @@ async function waitForRestart(){
   throw new Error('service did not come back within 30s');
 }
 
+// --- Camera health card ---
+function fmtAge(ms){
+  if (!ms || ms <= 0) return 'never';
+  const s = Math.max(0, Math.floor(ms / 1000));
+  if (s < 60) return s + 's ago';
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + 'm ago';
+  const h = Math.floor(m / 60);
+  if (h < 48) return h + 'h ago';
+  return Math.floor(h / 24) + 'd ago';
+}
+function pillFor(ageMs){
+  if (ageMs == null) return '<span class="pill grey">unknown</span>';
+  const m = ageMs / 60000;
+  if (m < 60)   return '<span class="pill green">healthy</span>';
+  if (m < 360)  return '<span class="pill amber">stale</span>';
+  return '<span class="pill red">silent</span>';
+}
+async function loadCameraHealth(){
+  try {
+    const r = captureCsrf(await fetch('api/camera_health'));
+    const j = await r.json();
+    const body = document.getElementById('camhealth-body');
+    if (!j.cameras || !j.cameras.length){
+      body.innerHTML = '<tr><td colspan="6" style="color:#7a8190">No adopted cameras.</td></tr>';
+      return;
+    }
+    const now = j.now_ms || Date.now();
+    body.innerHTML = j.cameras.map(c => {
+      const age = c.last_event_ms ? (now - c.last_event_ms) : null;
+      return `<tr>
+        <td style="padding:4px 6px">${c.name || '(unnamed)'}</td>
+        <td style="padding:4px 6px;color:#9aa0a6">${c.host || '-'}</td>
+        <td style="padding:4px 6px">${c.is_third_party ? 'third-party' : 'first-party'}</td>
+        <td style="padding:4px 6px">${fmtAge(age)}</td>
+        <td style="padding:4px 6px">${c.events_1h}</td>
+        <td style="padding:4px 6px">${pillFor(age)}</td>
+      </tr>`;
+    }).join('');
+  } catch (e) {
+    document.getElementById('camhealth-body').innerHTML =
+      '<tr><td colspan="6" style="color:#e0a0a0">Failed to load camera health.</td></tr>';
+  }
+}
+
 fetchStatus();
 loadFirstPartyCameras();
 loadConfig();
+loadCameraHealth();
 setInterval(fetchStatus, 30000);
+setInterval(loadCameraHealth, 30000);
 </script>
 </body></html>
 )HTML";
@@ -506,6 +607,30 @@ std::string build_status_json(const Ctx& ctx) {
   return j;
 }
 
+// Run `apt-get update` against the recorder's sources.list only.  Used by
+// /api/refresh_apt and /api/channel after a channel switch -- duplicating
+// the flag list keeps both endpoints consistent.
+std::pair<int, std::string> run_apt_update_recorder_only() {
+  std::string out;
+  int rc = run_cmd(
+      "apt-get update "
+      "-o Dir::Etc::sourcelist=/etc/apt/sources.list.d/onvif-recorder.list "
+      "-o Dir::Etc::sourceparts=- "
+      "-o APT::Get::List-Cleanup=0",
+      &out);
+  if (rc != 0) return {500, "apt update failed: " + out};
+  return {200, "package list refreshed"};
+}
+
+// Handle POST /api/refresh_apt -- the standalone "Refresh package list"
+// button.  Issue #28 confused users who ran `apt-get install --only-upgrade`
+// without `apt-get update` first; this exposes the refresh as an explicit
+// UI action so they can see when the cache was last updated.
+std::pair<int, std::string> handle_refresh_apt(const Ctx&) {
+  LOG(INFO) << "[admin] refreshing apt package list";
+  return run_apt_update_recorder_only();
+}
+
 // Handle POST /api/channel — body {"channel":"stable|rc|early-access"}.
 std::pair<int, std::string> handle_channel(const Ctx& ctx,
                                            const std::string& body) {
@@ -640,6 +765,47 @@ std::string build_config_json(const Ctx& ctx) {
   return j;
 }
 
+// Build JSON for GET /api/camera_health.  Single DB round-trip via
+// unifi::load_camera_health; emits one row per adopted camera with last
+// event time and 1-hour event count.
+std::string build_camera_health_json(const Ctx& ctx) {
+  const uint64_t now_ms = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch()).count());
+  std::string j = "{\"now_ms\":";
+  j += std::to_string(now_ms);
+  j += ",\"cameras\":[";
+  if (ctx.db == nullptr) {
+    j += "]}";
+    return j;
+  }
+  auto rows_or = unifi::load_camera_health(*ctx.db);
+  if (!rows_or.ok()) {
+    LOG(WARNING) << "[admin] load_camera_health: "
+                 << rows_or.status().message();
+    j += "]}";
+    return j;
+  }
+  bool first = true;
+  for (const auto& r : *rows_or) {
+    if (!first) j += ',';
+    first = false;
+    j += "{\"id\":\"";   j += json_escape(r.id);
+    j += "\",\"name\":\""; j += json_escape(r.name);
+    j += "\",\"host\":\""; j += json_escape(r.host);
+    j += "\",\"mac\":\"";  j += json_escape(r.mac);
+    j += "\",\"is_third_party\":";
+    j += r.is_third_party ? "true" : "false";
+    j += ",\"last_event_ms\":";
+    j += std::to_string(r.last_event_ms);
+    j += ",\"events_1h\":";
+    j += std::to_string(r.events_1h);
+    j += "}";
+  }
+  j += "]}";
+  return j;
+}
+
 // Build JSON for GET /api/first_party_cameras.
 std::string build_first_party_json(const Ctx& ctx) {
   std::string j = "{\"cameras\":[";
@@ -704,6 +870,70 @@ std::pair<int, std::string> handle_config(const Ctx& ctx,
     _exit(0);
   }
   return {200, "saved; service is restarting"};
+}
+
+// Build a tar.gz diagnostic archive in @p out_path.  Contents:
+//   - config.json        copy of /etc/onvif-recorder/config.json
+//   - journal.log        last 1000 lines of journalctl -u onvif-recorder
+//   - camera_health.json output of /api/camera_health
+//   - status.json        output of /api/status
+//   - dpkg.txt           dpkg-query -W onvif-recorder, unifi-protect, etc.
+//   - system.txt         uname -a, /sys/firmware/devicetree/base/model
+// Returns ok status when the tarball exists at out_path.
+absl::Status build_diagnostic_dump(const Ctx& ctx,
+                                   const std::string& out_path) {
+  char tmpl[] = "/tmp/onvif-dump.XXXXXX";
+  if (mkdtemp(tmpl) == nullptr)
+    return absl::InternalError("mkdtemp failed");
+  const std::string dir = tmpl;
+
+  // Helper: write content to a file inside dir; ignore write errors.
+  auto write = [&dir](const char* name, const std::string& content) {
+    std::ofstream f(dir + "/" + name, std::ios::binary | std::ios::trunc);
+    if (f.is_open()) f << content;
+  };
+  // Helper: capture the stdout of a shell command into a file.
+  auto capture = [&dir](const char* name, const std::string& cmd) {
+    std::string out;
+    run_cmd(cmd, &out);
+    std::ofstream f(dir + "/" + name, std::ios::binary | std::ios::trunc);
+    if (f.is_open()) f << out;
+  };
+
+  write("config.json",
+        read_file(ctx.config_path ? ctx.config_path : ""));
+  write("status.json", build_status_json(ctx));
+  write("camera_health.json", build_camera_health_json(ctx));
+  capture("journal.log",
+          "journalctl -u onvif-recorder -n 1000 --no-pager 2>/dev/null");
+  capture("dpkg.txt",
+          "dpkg-query -W -f='${Package} ${Version}\\n' "
+          "onvif-recorder unifi-protect unifi-core uos 2>/dev/null");
+  capture("system.txt",
+          "uname -a; "
+          "echo '---'; "
+          "cat /sys/firmware/devicetree/base/model 2>/dev/null; "
+          "echo; "
+          "free -h 2>/dev/null; "
+          "echo '---'; "
+          "df -h /var /srv 2>/dev/null");
+
+  const std::string cmd = "tar czf " + out_path + " -C " + dir + " . "
+                          "&& rm -rf " + dir;
+  std::string out;
+  int rc = run_cmd(cmd, &out);
+  if (rc != 0)
+    return absl::InternalError("tar/rm failed: " + out);
+  return absl::OkStatus();
+}
+
+// Read a binary file fully into a string.
+std::string read_file_binary(const std::string& path) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f.is_open()) return {};
+  std::stringstream ss;
+  ss << f.rdbuf();
+  return ss.str();
 }
 
 // Handle POST /api/uninstall — fire apt-get remove in the background.
@@ -772,6 +1002,22 @@ MHD_Result handler(
              std::strcmp(url, "/api/first_party_cameras") == 0) {
     body = build_first_party_json(*ctx);
     content_type = "application/json";
+  } else if (is_get &&
+             std::strcmp(url, "/api/camera_health") == 0) {
+    body = build_camera_health_json(*ctx);
+    content_type = "application/json";
+  } else if (is_get &&
+             std::strcmp(url, "/api/diagnostic_dump") == 0) {
+    const std::string tar_path = "/tmp/onvif-dump.tar.gz";
+    auto s = build_diagnostic_dump(*ctx, tar_path);
+    if (!s.ok()) {
+      status = 500;
+      body = std::string(s.message());
+    } else {
+      body = read_file_binary(tar_path);
+      std::remove(tar_path.c_str());
+      content_type = "application/gzip";
+    }
   } else if (is_post) {
     auto* pc = static_cast<PostCtx*>(*con_cls);
     const std::string& pb = pc->body;
@@ -780,6 +1026,8 @@ MHD_Result handler(
       r = handle_channel(*ctx, pb);
     else if (std::strcmp(url, "/api/check") == 0)
       r = handle_check();
+    else if (std::strcmp(url, "/api/refresh_apt") == 0)
+      r = handle_refresh_apt(*ctx);
     else if (std::strcmp(url, "/api/autoupdate") == 0)
       r = handle_autoupdate(pb);
     else if (std::strcmp(url, "/api/config") == 0)

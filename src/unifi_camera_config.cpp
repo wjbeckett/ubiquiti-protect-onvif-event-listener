@@ -242,6 +242,64 @@ absl::StatusOr<std::vector<FirstPartyCamera>> load_first_party_cameras(
 }
 
 // ---------------------------------------------------------------------------
+// load_camera_health (admin UI Camera Health card)
+// ---------------------------------------------------------------------------
+
+absl::StatusOr<std::vector<CameraHealth>> load_camera_health(
+    const DbConfig& db) {
+  PgConn pg(db);
+  if (!pg.ok())
+    return absl::InternalError("unifi::load_camera_health: " + pg.error());
+
+  // One round-trip: per-camera last event start + count in the last hour
+  // (0 for cameras with no events).  LATERAL joins keep the per-camera
+  // aggregates fast on Postgres' indexes for events.cameraId / start.
+  const char* sql =
+    "SELECT c.id, c.name, c.host, c.mac, c.\"isThirdPartyCamera\", "
+    "       COALESCE(le.last_start, 0) AS last_start, "
+    "       COALESCE(c1h.cnt, 0)       AS events_1h "
+    "FROM cameras c "
+    "LEFT JOIN LATERAL ("
+    "  SELECT MAX(start) AS last_start FROM events e "
+    "  WHERE e.\"cameraId\" = c.id"
+    ") le   ON true "
+    "LEFT JOIN LATERAL ("
+    "  SELECT COUNT(*) AS cnt FROM events e "
+    "  WHERE e.\"cameraId\" = c.id "
+    "    AND e.start > "
+    "        (extract(epoch from now()) * 1000 - 3600000)::bigint"
+    ") c1h  ON true "
+    "WHERE c.\"isAdopted\" = true "
+    "ORDER BY c.\"isThirdPartyCamera\" DESC, c.name";
+
+  PGresult* res = PQexec(pg.conn, sql);
+  if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+    std::string err = PQresultErrorMessage(res);
+    PQclear(res);
+    return absl::InternalError(
+        "unifi::load_camera_health query: " + err);
+  }
+  std::vector<CameraHealth> rows;
+  int n = PQntuples(res);
+  for (int i = 0; i < n; ++i) {
+    CameraHealth h;
+    h.id   = PQgetvalue(res, i, 0);
+    h.name = PQgetisnull(res, i, 1) ? "" : PQgetvalue(res, i, 1);
+    h.host = PQgetisnull(res, i, 2) ? "" : PQgetvalue(res, i, 2);
+    h.mac  = PQgetisnull(res, i, 3) ? "" : PQgetvalue(res, i, 3);
+    h.is_third_party =
+        std::string(PQgetvalue(res, i, 4)) == "t";
+    h.last_event_ms = static_cast<uint64_t>(
+        std::stoull(PQgetvalue(res, i, 5)));
+    h.events_1h = static_cast<uint64_t>(
+        std::stoull(PQgetvalue(res, i, 6)));
+    rows.push_back(std::move(h));
+  }
+  PQclear(res);
+  return rows;
+}
+
+// ---------------------------------------------------------------------------
 // load_all_first_party (admin UI tickbox list)
 // ---------------------------------------------------------------------------
 
