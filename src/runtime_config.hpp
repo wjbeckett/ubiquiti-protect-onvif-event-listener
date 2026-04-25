@@ -1,0 +1,55 @@
+// Copyright 2026 Daniel W
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+
+#ifndef SRC_RUNTIME_CONFIG_HPP_
+#define SRC_RUNTIME_CONFIG_HPP_
+
+#include <map>
+#include <string>
+#include <vector>
+
+#include "absl/status/status.h"
+
+namespace runtime_config {
+
+enum class Type { Bool, Int, UInt16, String };
+
+// Schema entry for one user-overridable flag.  The schema is the single
+// source of truth for: which flags can be overridden via the config file,
+// how the admin UI renders them, and how values are validated.
+struct Entry {
+  const char* name;
+  Type        type;
+  const char* description;
+  const char* group;        ///< UI grouping label
+};
+
+// Returns the (statically-defined) schema.  Order is preserved for the
+// admin UI rendering.
+const std::vector<Entry>& Schema();
+
+// Reads @p path (a flat JSON object of string values) and, for every
+// non-empty value matching a schema entry, calls absl::FindCommandLineFlag
+// + ParseFrom to override the flag.  Missing file or empty string values
+// are no-ops.  Returns the number of overrides applied.  Errors are
+// logged but non-fatal -- a misconfigured key never blocks startup.
+int LoadFromFile(const std::string& path);
+
+// Reads @p path and returns the raw string value for each schema key.
+// Missing file -> map with empty values for every schema key.
+std::map<std::string, std::string> ReadFromFile(const std::string& path);
+
+// Writes @p values as a JSON object to @p path atomically (tmp + rename).
+// Keys not present in @p values are written as empty strings; unknown
+// keys (not in the schema) are dropped.
+absl::Status WriteToFile(const std::string& path,
+                         const std::map<std::string, std::string>& values);
+
+}  // namespace runtime_config
+
+#endif  // SRC_RUNTIME_CONFIG_HPP_

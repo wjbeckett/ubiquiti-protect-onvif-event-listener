@@ -242,6 +242,44 @@ absl::StatusOr<std::vector<FirstPartyCamera>> load_first_party_cameras(
 }
 
 // ---------------------------------------------------------------------------
+// load_all_first_party (admin UI tickbox list)
+// ---------------------------------------------------------------------------
+
+absl::StatusOr<std::vector<FirstPartyCamera>>
+load_all_first_party(const DbConfig& db) {
+  PgConn pg(db);
+  if (!pg.ok())
+    return absl::InternalError(
+        "unifi::load_all_first_party: " + pg.error());
+
+  const char* sql =
+    "SELECT id, name, mac "
+    "FROM cameras "
+    "WHERE \"isThirdPartyCamera\" = false "
+    "  AND \"isAdopted\" = true "
+    "ORDER BY name";
+
+  PGresult* res = PQexec(pg.conn, sql);
+  if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+    std::string err = PQresultErrorMessage(res);
+    PQclear(res);
+    return absl::InternalError(
+        "unifi::load_all_first_party query: " + err);
+  }
+  std::vector<FirstPartyCamera> cameras;
+  int nrows = PQntuples(res);
+  for (int i = 0; i < nrows; ++i) {
+    FirstPartyCamera c;
+    c.id   = PQgetvalue(res, i, 0);
+    c.name = PQgetisnull(res, i, 1) ? "" : PQgetvalue(res, i, 1);
+    c.mac  = PQgetisnull(res, i, 2) ? "" : PQgetvalue(res, i, 2);
+    cameras.push_back(std::move(c));
+  }
+  PQclear(res);
+  return cameras;
+}
+
+// ---------------------------------------------------------------------------
 // load_all_nonsmartdetect_first_party (auto-discover)
 // ---------------------------------------------------------------------------
 

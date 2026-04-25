@@ -67,6 +67,7 @@
 #include "object_detect.hpp"
 #include "onvif_listener.hpp"
 #include "protect_ui_patch.hpp"
+#include "runtime_config.hpp"
 #include "unifi_camera_config.hpp"
 #include "util.hpp"
 
@@ -318,6 +319,12 @@ int main(int argc, char* argv[]) {
   static onvif::LogRing log_ring;
   absl::AddLogSink(&log_ring);
 
+  // Apply config-file overrides BEFORE the first GetFlag read so every
+  // subsequent flag access sees the user's saved values from the admin
+  // UI.  Empty / missing keys leave the underlying flag untouched.
+  const std::string kConfigPath = "/etc/onvif-recorder/config.json";
+  runtime_config::LoadFromFile(kConfigPath);
+
   const bool verbose = absl::GetFlag(FLAGS_verbose);
   if (verbose) {
     absl::SetStderrThreshold(absl::LogSeverityAtLeast::kInfo);
@@ -440,7 +447,8 @@ int main(int argc, char* argv[]) {
   onvif::AdminServer admin_server;
   const uint16_t admin_port = absl::GetFlag(FLAGS_admin_port);
   const std::string channel_file = absl::GetFlag(FLAGS_channel_file);
-  if (admin_server.start(ONVIF_RECORDER_VERSION, channel_file, admin_port)) {
+  if (admin_server.start(ONVIF_RECORDER_VERSION, channel_file, admin_port,
+                         kConfigPath, cam_db)) {
     LOG(INFO) << "[admin_server] listening on 127.0.0.1:" << admin_port;
     auto ng_a = protect_ui::patch_nginx_admin_proxy(admin_port);
     if (!ng_a.ok())

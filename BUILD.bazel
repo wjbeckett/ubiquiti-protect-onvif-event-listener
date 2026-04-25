@@ -77,7 +77,12 @@ cc_library(
     hdrs = ["src/admin_server.hpp"],
     strip_include_prefix = "src",
     deps = _MHD + [
+        ":runtime_config",
+        ":unifi_camera_config",
+        "@com_google_absl//absl/flags:commandlineflag",
+        "@com_google_absl//absl/flags:reflection",
         "@com_google_absl//absl/log:log",
+        "@com_google_absl//absl/status:status",
     ],
     visibility = ["//visibility:public"],
 )
@@ -93,6 +98,21 @@ cc_library(
         "@com_google_absl//absl/log:log",
         "@com_google_absl//absl/status:status",
         "@com_google_absl//absl/status:statusor",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "runtime_config",
+    srcs = ["src/runtime_config.cpp"],
+    hdrs = ["src/runtime_config.hpp"],
+    strip_include_prefix = "src",
+    deps = [
+        ":unifi_camera_config",
+        "@com_google_absl//absl/flags:commandlineflag",
+        "@com_google_absl//absl/flags:reflection",
+        "@com_google_absl//absl/log:log",
+        "@com_google_absl//absl/status:status",
     ],
     visibility = ["//visibility:public"],
 )
@@ -279,6 +299,7 @@ cc_binary(
         ":object_detect",
         ":onvif_listener",
         ":protect_ui_patch",
+        ":runtime_config",
         ":unifi_camera_config",
         ":util",
         "@com_google_absl//absl/flags:flag",

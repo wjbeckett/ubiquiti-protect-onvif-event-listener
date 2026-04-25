@@ -17,6 +17,8 @@
 #include <cstdint>
 #include <string>
 
+#include "unifi_camera_config.hpp"
+
 struct MHD_Daemon;
 
 namespace onvif {
@@ -42,7 +44,9 @@ class AdminServer {
   /// the chosen port is then available via port().
   bool start(const std::string& version,
              const std::string& channel_file,
-             uint16_t port = 7891);
+             uint16_t port = 7891,
+             const std::string& config_path = "/etc/onvif-recorder/config.json",
+             const unifi::DbConfig& db = unifi::DbConfig{});
 
   /// Return the port the server is listening on. Only meaningful after a
   /// successful start().  Useful when start() was called with port=0.
@@ -61,6 +65,8 @@ class AdminServer {
   ::MHD_Daemon* daemon_{nullptr};
   std::string version_;
   std::string channel_file_;
+  std::string config_path_;
+  unifi::DbConfig db_;
   uint16_t port_{0};
 };
 

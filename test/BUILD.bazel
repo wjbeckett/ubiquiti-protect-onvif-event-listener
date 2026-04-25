@@ -226,6 +226,15 @@ cc_test(
 )
 
 cc_test(
+    name = "test_runtime_config",
+    srcs = ["test_runtime_config.cpp"],
+    deps = [
+        "//:runtime_config",
+        "@com_google_absl//absl/flags:flag",
+    ],
+)
+
+cc_test(
     name = "test_unifi_camera_config",
     srcs = ["test_unifi_camera_config.cpp"],
     deps = [

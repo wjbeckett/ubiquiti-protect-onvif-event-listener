@@ -13,8 +13,10 @@ EnvironmentFile=-/etc/default/onvif-recorder
 # Variables set here win because systemd loads files in declared order.
 EnvironmentFile=-/etc/default/onvif-recorder.local
 ExecStart=/usr/bin/onvif-recorder $ONVIF_RECORDER_FLAGS
-Restart=on-failure
-RestartSec=10
+# `always` (rather than `on-failure`) lets the admin UI write a new config
+# and exit cleanly to apply it; systemd brings the service back up.
+Restart=always
+RestartSec=2
 StandardOutput=journal
 StandardError=journal
 

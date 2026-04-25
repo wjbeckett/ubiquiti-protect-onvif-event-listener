@@ -236,17 +236,116 @@ void MotionPoller::init_high_water_marks() {
 // Main poll loop
 // ---------------------------------------------------------------------------
 
+// Log the recent event-type distribution for every watched camera.
+// Used at startup and periodically so a journal capture immediately
+// shows whether each camera is producing the `motion` events the poller
+// looks for, vs `smartDetectZone` (already-classified) or nothing at all.
+void MotionPoller::log_event_type_breakdown(const char* label) {
+  const uint64_t since_ms = util::now_ms() - 3600000ULL;  // last hour
+  const std::string since_str = std::to_string(since_ms);
+  for (const auto& cam_id : impl_->camera_ids) {
+    impl_->maybe_reconnect();
+    const char* params[] = { cam_id.c_str(), since_str.c_str() };
+    PGresult* res = PQexecParams(impl_->conn,
+      "SELECT type, COUNT(*) FROM events "
+      "WHERE \"cameraId\" = $1 AND start > $2::bigint "
+      "GROUP BY type ORDER BY 2 DESC",
+      2, nullptr, params, nullptr, nullptr, 0);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+      PQclear(res);
+      continue;
+    }
+    std::string summary;
+    const int n = PQntuples(res);
+    for (int i = 0; i < n; ++i) {
+      if (i > 0) summary += ' ';
+      summary += PQgetvalue(res, i, 0);
+      summary += '=';
+      summary += PQgetvalue(res, i, 1);
+    }
+    PQclear(res);
+    if (summary.empty()) summary = "(no events in last 1h)";
+    LOG(INFO) << "[motion_poller] " << label << " camera " << cam_id
+              << " last 1h: " << summary;
+  }
+}
+
 void MotionPoller::poll_loop() {
   LOG(INFO) << "[motion_poller] started, watching "
             << impl_->camera_ids.size() << " camera(s), interval "
             << impl_->poll_interval_sec << "s";
 
+  // (A) Detector readiness.  start() already returns early when the
+  // detector is null, but log explicitly so the journal makes it
+  // unambiguous what classifier (if any) the poller will run.
+  if (impl_->detector != nullptr) {
+    LOG(INFO) << "[motion_poller] detector ready: NanoDet-M loaded";
+  } else {
+    LOG(WARNING) << "[motion_poller] detector is null; motion events "
+                 << "will not be classified";
+  }
+
   init_high_water_marks();
+
+  // (B) Per-camera event-type breakdown at startup.  Tells us
+  // immediately whether the cameras are emitting `motion` (what the
+  // poller looks for) or `smartDetectZone` directly (native AI) or
+  // nothing at all -- a frequent source of "first-party not classified"
+  // confusion.
+  log_event_type_breakdown("startup");
+
+  // (C) Periodic heartbeat: aggregate counts across the last
+  // kHeartbeatEveryPolls polls and emit a single line summary.
+  // (B) Periodic event-type breakdown: same query as startup, every
+  // kBreakdownEveryPolls polls.
+  constexpr int kHeartbeatEveryPolls = 5;
+  constexpr int kBreakdownEveryPolls = 180;  // ~30 min at 10s interval
+  int polls_since_heartbeat = 0;
+  int polls_since_breakdown = 0;
+  uint64_t hb_candidates = 0;
+  uint64_t hb_classified = 0;
+  uint64_t hb_skipped_no_thumb = 0;
+  uint64_t hb_skipped_overlap = 0;
 
   // Pre-build the PostgreSQL array of camera IDs.
   const std::string cam_arr = pg_array(impl_->camera_ids);
   while (running_.load()) {
     impl_->maybe_reconnect();
+
+    // (D) Count motion events in the same window that WOULD have
+    // matched but were excluded by the NOT EXISTS smartDetectZone
+    // filter.  Lets the journal show "we had candidates but Protect
+    // already classified them" -- otherwise they're invisible.
+    {
+      uint64_t min_hwm_d = UINT64_MAX;
+      for (const auto& [id, h] : impl_->hwm)
+        if (h < min_hwm_d) min_hwm_d = h;
+      if (min_hwm_d == UINT64_MAX) min_hwm_d = util::now_ms() - 3600000ULL;
+      const std::string hwm_str_d = std::to_string(min_hwm_d);
+      const char* params_d[] = { cam_arr.c_str(), hwm_str_d.c_str() };
+      PGresult* res_d = PQexecParams(impl_->conn,
+        "SELECT COUNT(*) FROM events e "
+        "WHERE e.type = 'motion' "
+        "  AND e.\"cameraId\" = ANY($1) "
+        "  AND e.start > $2::bigint "
+        "  AND e.\"thumbnailId\" IS NOT NULL "
+        "  AND e.\"end\" IS NOT NULL "
+        "  AND EXISTS ( "
+        "    SELECT 1 FROM events e2 "
+        "    WHERE e2.type = 'smartDetectZone' "
+        "      AND e2.\"cameraId\" = e.\"cameraId\" "
+        "      AND e2.start >= e.start - 5000 "
+        "      AND e2.start <= e.\"end\" + 5000 "
+        "  )",
+        2, nullptr, params_d, nullptr, nullptr, 0);
+      if (PQresultStatus(res_d) == PGRES_TUPLES_OK &&
+          PQntuples(res_d) > 0) {
+        uint64_t n = static_cast<uint64_t>(
+            std::stoull(PQgetvalue(res_d, 0, 0)));
+        hb_skipped_overlap += n;
+      }
+      PQclear(res_d);
+    }
 
     // Use the minimum hwm across all cameras for the poll query.
     uint64_t min_hwm = UINT64_MAX;
@@ -283,6 +382,7 @@ void MotionPoller::poll_loop() {
 
     {
       const int nrows = PQntuples(res);
+      hb_candidates += static_cast<uint64_t>(nrows);
       if (nrows > 0)
         LOG(INFO) << "[motion_poller] poll returned " << nrows
                   << " motion event(s) to process";
@@ -323,6 +423,7 @@ void MotionPoller::poll_loop() {
                     << " (query status="
                     << PQresStatus(PQresultStatus(thumb_res)) << ")";
           PQclear(thumb_res);
+          ++hb_skipped_no_thumb;
           // Update hwm even on skip so we don't retry endlessly.
           impl_->hwm[cam_id] = start_ms;
           continue;
@@ -509,6 +610,7 @@ void MotionPoller::poll_loop() {
         LOG(INFO) << "[motion_poller] " << obj_type << " detected in "
                   << cam_id << " (motion event " << ev_id << ")";
 
+        ++hb_classified;
         // Update high-water mark.
         impl_->hwm[cam_id] = start_ms;
       }
@@ -517,6 +619,34 @@ void MotionPoller::poll_loop() {
     PQclear(res);
 
   sleep:
+    // (C) Heartbeat: every kHeartbeatEveryPolls cycles, summarise what
+    // happened.  Always fires even when the pipeline is idle so the
+    // journal makes "the poller is alive but nothing matched" obvious.
+    if (++polls_since_heartbeat >= kHeartbeatEveryPolls) {
+      uint64_t min_hwm_log = UINT64_MAX;
+      for (const auto& [id, h] : impl_->hwm)
+        if (h < min_hwm_log) min_hwm_log = h;
+      LOG(INFO) << "[motion_poller] heartbeat: " << kHeartbeatEveryPolls
+                << " polls, " << hb_candidates << " candidates, "
+                << hb_classified << " classified, "
+                << hb_skipped_no_thumb << " skipped(no_thumb), "
+                << hb_skipped_overlap
+                << " excluded(already smartDetectZone), hwm-min="
+                << (min_hwm_log == UINT64_MAX ? 0 : min_hwm_log);
+      polls_since_heartbeat = 0;
+      hb_candidates = 0;
+      hb_classified = 0;
+      hb_skipped_no_thumb = 0;
+      hb_skipped_overlap = 0;
+    }
+
+    // (B) Periodic event-type breakdown so a long-running journal still
+    // carries fresh visibility into what each camera is producing.
+    if (++polls_since_breakdown >= kBreakdownEveryPolls) {
+      log_event_type_breakdown("periodic");
+      polls_since_breakdown = 0;
+    }
+
     // Sleep in short increments so stop() is responsive.
     for (int s = 0; s < impl_->poll_interval_sec && running_.load(); ++s)
       std::this_thread::sleep_for(std::chrono::seconds(1));

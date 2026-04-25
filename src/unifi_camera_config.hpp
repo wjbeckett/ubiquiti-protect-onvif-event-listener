@@ -82,6 +82,11 @@ absl::StatusOr<std::vector<FirstPartyCamera>> load_first_party_cameras(
 absl::StatusOr<std::vector<FirstPartyCamera>>  // NOLINT(whitespace/indent_namespace)
 load_all_nonsmartdetect_first_party(const DbConfig& db = {});
 
+/// Load every adopted first-party camera regardless of smart-detect state.
+/// Used by the admin UI to populate the first-party tickbox list.
+absl::StatusOr<std::vector<FirstPartyCamera>>  // NOLINT(whitespace/indent_namespace)
+load_all_first_party(const DbConfig& db = {});
+
 /// Search for adopted first-party cameras whose `type` column contains any
 /// of the given @p model_substrings (case-insensitive ILIKE match).
 /// For example, passing {"G3 Instant"} matches cameras with type

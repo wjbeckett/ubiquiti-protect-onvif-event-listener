@@ -22,15 +22,25 @@
 typedef int MHD_Result;
 #endif
 
+#include <signal.h>
+#include <unistd.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <sstream>
 #include <string>
 #include <utility>
+#include <vector>
 
+#include "absl/flags/commandlineflag.h"
+#include "absl/flags/reflection.h"
 #include "absl/log/log.h"
+#include "absl/status/status.h"
+
+#include "runtime_config.hpp"
 
 namespace onvif {
 
@@ -61,6 +71,24 @@ button.danger:hover{background:#d44}
 .msg{padding:8px 12px;border-radius:4px;margin-top:8px;font-size:13px;display:none}
 .msg.ok{background:#1a3a1a;color:#a0e0a0;display:block}
 .msg.err{background:#3a1a1a;color:#e0a0a0;display:block}
+.cfg-row{display:grid;grid-template-columns:240px 1fr;gap:8px;align-items:start;margin:6px 0}
+.cfg-row label{color:#c6c9cc;font-size:13px}
+.cfg-row .desc{color:#7a8190;font-size:12px;margin-top:2px}
+.cfg-row .input input,.cfg-row .input select{width:100%;box-sizing:border-box}
+.cfg-row .placeholder{color:#5a6172;font-size:11px;margin-top:2px}
+.cfg-section{font-size:13px;color:#9aa0a6;text-transform:uppercase;letter-spacing:.04em;
+margin:12px 0 4px 0;border-top:1px solid #2a3140;padding-top:12px}
+.cfg-section:first-child{border-top:0;padding-top:0;margin-top:0}
+.fp-list{max-height:240px;overflow-y:auto;border:1px solid #2a3140;border-radius:4px;
+padding:6px}
+.fp-row{display:flex;align-items:center;gap:8px;padding:2px 0;font-size:13px}
+.spinner{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(14,17,24,0.9);
+display:none;align-items:center;justify-content:center;flex-direction:column;gap:12px;
+z-index:99}
+.spinner.on{display:flex}
+.spinner-circle{width:36px;height:36px;border:3px solid #3a4255;border-top-color:#1e6feb;
+border-radius:50%;animation:spin 1s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
 </style></head><body>
 <h1>ONVIF Recorder</h1>
 
@@ -89,14 +117,43 @@ button.danger:hover{background:#d44}
 <button onclick="checkNow()">Check now</button></div>
 <div class="msg" id="autoupdate-msg"></div></div>
 
+<div class="card"><h2>First-party cameras</h2>
+<p class="desc" style="font-size:12px;color:#9aa0a6;margin:0 0 8px 0">
+Tick cameras to enable smart-detect on them via NanoDet-M motion polling.
+Saved to the configuration below as <code>first_party_cameras</code>.</p>
+<div class="fp-list" id="fp-list">Loading…</div></div>
+
+<div class="card"><h2>Configuration</h2>
+<p class="desc" style="font-size:12px;color:#9aa0a6;margin:0 0 8px 0">
+Empty fields fall back to flag defaults / unit-file values.  Saving
+restarts the service so changes take effect immediately.</p>
+<div id="config-form">Loading…</div>
+<div class="row"><button onclick="saveConfig()">Save &amp; restart</button></div>
+<div class="msg" id="config-msg"></div></div>
+
 <div class="card"><h2>Uninstall</h2>
 <div class="row"><label>Remove onvif-recorder and all patches</label>
 <button class="danger" onclick="uninstall()">Uninstall</button></div>
 <div class="msg" id="uninstall-msg"></div></div>
 
+<div class="spinner" id="spinner">
+<div class="spinner-circle"></div>
+<div id="spinner-text">Restarting service…</div></div>
+
 <script>
+// UniFi OS's nginx proxy gates non-GET methods through auth_request, which
+// requires the X-Csrf-Token header to match the token nginx attaches to
+// every proxied response.  Capture it from each response and echo it on
+// subsequent POSTs.  A GET response refreshes csrfToken; if a POST 403s
+// (token rotated), retry once after a fresh GET.
+let csrfToken = '';
+function captureCsrf(r){
+  const t = r.headers.get('X-Csrf-Token');
+  if (t) csrfToken = t;
+  return r;
+}
 async function fetchStatus(){
-  const r = await fetch('api/status');
+  const r = captureCsrf(await fetch('api/status'));
   const j = await r.json();
   const rows = [
     ['Version', j.version],
@@ -115,10 +172,19 @@ function msg(id, text, ok){
   e.textContent = text;
   e.className = 'msg ' + (ok ? 'ok' : 'err');
 }
+async function postOnce(path, body){
+  return captureCsrf(await fetch(path, {method:'POST',
+    headers:{'Content-Type':'application/json',
+             'X-Csrf-Token': csrfToken},
+    body: JSON.stringify(body||{})}));
+}
 async function post(path, body){
-  const r = await fetch(path, {method:'POST',
-    headers:{'Content-Type':'application/json'},
-    body: JSON.stringify(body||{})});
+  let r = await postOnce(path, body);
+  // 403 commonly means the cached CSRF token rotated -- refresh and retry.
+  if (r.status === 403) {
+    captureCsrf(await fetch('api/status'));
+    r = await postOnce(path, body);
+  }
   return {ok: r.ok, text: await r.text()};
 }
 async function setChannel(){
@@ -143,7 +209,130 @@ async function uninstall(){
   const r = await post('api/uninstall', {});
   msg('uninstall-msg', r.text, r.ok);
 }
+
+// --- Configuration form (driven by /api/config schema) -----------------
+
+let configEntries = [];        // schema entries (one per editable flag)
+let firstPartyCameras = [];    // {id, name, mac}
+let firstPartyChecked = new Set();  // ticked IDs
+
+function renderConfigForm(entries){
+  const root = document.getElementById('config-form');
+  let lastGroup = '';
+  let html = '';
+  for (const e of entries){
+    if (e.name === 'first_party_cameras') continue;  // rendered separately
+    if (e.group !== lastGroup){
+      html += `<div class="cfg-section">${e.group}</div>`;
+      lastGroup = e.group;
+    }
+    let inputHtml;
+    if (e.type === 'bool'){
+      inputHtml = `<select id="cfg-${e.name}">`
+        + `<option value="">(default: ${e.flag_default})</option>`
+        + `<option value="true">true</option>`
+        + `<option value="false">false</option></select>`;
+    } else {
+      const ph = `(default: ${e.flag_default || '""'})`;
+      inputHtml = `<input type="text" id="cfg-${e.name}" placeholder="${ph}">`;
+    }
+    html += `<div class="cfg-row"><label>${e.name}<div class="desc">${e.description}</div></label>`
+         +  `<div class="input">${inputHtml}</div></div>`;
+  }
+  root.innerHTML = html;
+  // Apply override values.
+  for (const e of entries){
+    const el = document.getElementById('cfg-' + e.name);
+    if (el && e.override) el.value = e.override;
+  }
+}
+
+function renderFirstPartyList(cams, checked){
+  const root = document.getElementById('fp-list');
+  if (!cams.length){
+    root.innerHTML = `<div style="color:#7a8190">No first-party cameras adopted in Protect.</div>`;
+    return;
+  }
+  root.innerHTML = cams.map(c => {
+    const isChecked = checked.has(c.id) ? 'checked' : '';
+    return `<div class="fp-row"><input type="checkbox" id="fp-${c.id}" ${isChecked}>`
+        +  `<label for="fp-${c.id}">${c.name || '(unnamed)'} `
+        +  `<span style="color:#7a8190">[${c.id}]</span></label></div>`;
+  }).join('');
+}
+
+async function loadConfig(){
+  const r = captureCsrf(await fetch('api/config'));
+  const j = await r.json();
+  configEntries = j.entries || [];
+  // first_party_cameras override is a CSV string; expand into the Set.
+  firstPartyChecked = new Set();
+  const fp = configEntries.find(e => e.name === 'first_party_cameras');
+  if (fp && fp.override){
+    fp.override.split(',').map(s => s.trim()).filter(Boolean)
+      .forEach(id => firstPartyChecked.add(id));
+  }
+  renderConfigForm(configEntries);
+  renderFirstPartyList(firstPartyCameras, firstPartyChecked);
+}
+
+async function loadFirstPartyCameras(){
+  const r = captureCsrf(await fetch('api/first_party_cameras'));
+  const j = await r.json();
+  firstPartyCameras = j.cameras || [];
+  renderFirstPartyList(firstPartyCameras, firstPartyChecked);
+}
+
+async function saveConfig(){
+  const values = {};
+  for (const e of configEntries){
+    if (e.name === 'first_party_cameras') continue;
+    const el = document.getElementById('cfg-' + e.name);
+    if (el) values[e.name] = el.value || '';
+  }
+  // Collect ticked first-party cameras into a CSV string.
+  const ticked = firstPartyCameras
+    .filter(c => document.getElementById('fp-' + c.id)?.checked)
+    .map(c => c.id);
+  values.first_party_cameras = ticked.join(',');
+
+  const sp = document.getElementById('spinner');
+  document.getElementById('spinner-text').textContent = 'Saving config and restarting service…';
+  sp.classList.add('on');
+  try {
+    const r = await post('api/config', values);
+    if (!r.ok) {
+      msg('config-msg', r.text, false);
+      sp.classList.remove('on');
+      return;
+    }
+    // Service is exiting; poll /api/status until it answers again.
+    await waitForRestart();
+    await loadConfig();
+    await fetchStatus();
+    msg('config-msg', 'Saved.', true);
+  } finally {
+    sp.classList.remove('on');
+  }
+}
+
+async function waitForRestart(){
+  const deadline = Date.now() + 30000;  // 30s
+  // Brief delay so the old process has time to die before we start polling.
+  await new Promise(r => setTimeout(r, 1500));
+  while (Date.now() < deadline){
+    try {
+      const r = await fetch('api/status', {cache: 'no-store'});
+      if (r.ok){ captureCsrf(r); return; }
+    } catch (_) { /* connection refused while service is down */ }
+    await new Promise(r => setTimeout(r, 1000));
+  }
+  throw new Error('service did not come back within 30s');
+}
+
 fetchStatus();
+loadFirstPartyCameras();
+loadConfig();
 setInterval(fetchStatus, 30000);
 </script>
 </body></html>
@@ -251,6 +440,8 @@ struct PostCtx {
 struct Ctx {
   const char* version;
   const char* channel_file;
+  const char* config_path;
+  const unifi::DbConfig* db;  // optional; may have empty conn_string
 };
 
 // Build a JSON response body for GET /api/status.
@@ -392,6 +583,129 @@ std::pair<int, std::string> handle_autoupdate(const std::string& body) {
   return {200, "auto-update disabled"};
 }
 
+// Escape @p s for embedding inside a JSON string literal.
+std::string json_escape(const std::string& s) {
+  std::string out;
+  out.reserve(s.size() + 2);
+  for (char c : s) {
+    switch (c) {
+      case '"':  out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\n': out += "\\n";  break;
+      case '\r': out += "\\r";  break;
+      case '\t': out += "\\t";  break;
+      default:
+        if (static_cast<unsigned char>(c) < 0x20) {
+          char buf[8];
+          std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+          out += buf;
+        } else {
+          out += c;
+        }
+    }
+  }
+  return out;
+}
+
+// Build JSON for GET /api/config: schema + override values + flag defaults.
+std::string build_config_json(const Ctx& ctx) {
+  auto overrides = runtime_config::ReadFromFile(ctx.config_path);
+
+  std::string j = "{\"entries\":[";
+  bool first = true;
+  for (const auto& e : runtime_config::Schema()) {
+    if (!first) j += ',';
+    first = false;
+    const char* type_str = "string";
+    switch (e.type) {
+      case runtime_config::Type::Bool:    type_str = "bool";    break;
+      case runtime_config::Type::Int:     type_str = "int";     break;
+      case runtime_config::Type::UInt16:  type_str = "uint16";  break;
+      case runtime_config::Type::String:  type_str = "string";  break;
+    }
+    std::string flag_default;
+    auto* flag = absl::FindCommandLineFlag(e.name);
+    if (flag != nullptr) flag_default = flag->CurrentValue();
+    j += "{\"name\":\"";    j += json_escape(e.name);
+    j += "\",\"type\":\"";  j += type_str;
+    j += "\",\"description\":\""; j += json_escape(e.description);
+    j += "\",\"group\":\""; j += json_escape(e.group);
+    j += "\",\"flag_default\":\""; j += json_escape(flag_default);
+    j += "\",\"override\":\"";
+    auto it = overrides.find(e.name);
+    j += json_escape(it != overrides.end() ? it->second : std::string());
+    j += "\"}";
+  }
+  j += "]}";
+  return j;
+}
+
+// Build JSON for GET /api/first_party_cameras.
+std::string build_first_party_json(const Ctx& ctx) {
+  std::string j = "{\"cameras\":[";
+  if (ctx.db == nullptr) {
+    j += "]}";
+    return j;
+  }
+  auto cams_or = unifi::load_all_first_party(*ctx.db);
+  if (!cams_or.ok()) {
+    LOG(WARNING) << "[admin] load_all_first_party: "
+                 << cams_or.status().message();
+    j += "]}";
+    return j;
+  }
+  bool first = true;
+  for (const auto& c : *cams_or) {
+    if (!first) j += ',';
+    first = false;
+    j += "{\"id\":\"";   j += json_escape(c.id);
+    j += "\",\"name\":\""; j += json_escape(c.name);
+    j += "\",\"mac\":\"";  j += json_escape(c.mac);
+    j += "\"}";
+  }
+  j += "]}";
+  return j;
+}
+
+// Handle POST /api/config — body is a JSON object of name->string values.
+// Validates each value against its schema entry, writes the file, then
+// signals SIGTERM to ourselves so systemd restarts the service with the
+// new overrides applied.
+std::pair<int, std::string> handle_config(const Ctx& ctx,
+                                          const std::string& body) {
+  std::map<std::string, std::string> values;
+  for (const auto& e : runtime_config::Schema()) {
+    std::string raw = json_string_field(body, e.name);
+    // Validate non-empty values against the flag's parser.
+    if (!raw.empty()) {
+      auto* flag = absl::FindCommandLineFlag(e.name);
+      if (flag == nullptr) continue;  // schema/flag mismatch -- skip
+      std::string err;
+      // ParseFrom mutates the flag, but we only call it for validation.
+      // The change is overwritten on the next process restart by
+      // LoadFromFile reading the persisted JSON.
+      if (!flag->ParseFrom(raw, &err)) {
+        return {400, std::string("invalid ") + e.name + ": " + err};
+      }
+    }
+    values[e.name] = raw;
+  }
+  auto s = runtime_config::WriteToFile(ctx.config_path, values);
+  if (!s.ok()) return {500, std::string(s.message())};
+
+  // Detach a child to send SIGTERM after we've returned the response, so
+  // the client sees a clean 200 before the service exits and systemd
+  // restarts it.
+  pid_t self = getpid();
+  if (fork() == 0) {
+    // Child: brief delay then signal the parent.
+    sleep(1);
+    kill(self, SIGTERM);
+    _exit(0);
+  }
+  return {200, "saved; service is restarting"};
+}
+
 // Handle POST /api/uninstall — fire apt-get remove in the background.
 std::pair<int, std::string> handle_uninstall() {
   // Detach: the running process is about to be stopped by apt-get.
@@ -450,6 +764,14 @@ MHD_Result handler(
              std::strcmp(url, "/api/status") == 0) {
     body = build_status_json(*ctx);
     content_type = "application/json";
+  } else if (is_get &&
+             std::strcmp(url, "/api/config") == 0) {
+    body = build_config_json(*ctx);
+    content_type = "application/json";
+  } else if (is_get &&
+             std::strcmp(url, "/api/first_party_cameras") == 0) {
+    body = build_first_party_json(*ctx);
+    content_type = "application/json";
   } else if (is_post) {
     auto* pc = static_cast<PostCtx*>(*con_cls);
     const std::string& pb = pc->body;
@@ -460,6 +782,8 @@ MHD_Result handler(
       r = handle_check();
     else if (std::strcmp(url, "/api/autoupdate") == 0)
       r = handle_autoupdate(pb);
+    else if (std::strcmp(url, "/api/config") == 0)
+      r = handle_config(*ctx, pb);
     else if (std::strcmp(url, "/api/uninstall") == 0)
       r = handle_uninstall();
     status = r.first;
@@ -496,9 +820,13 @@ void request_completed(void* /*cls*/,
 
 bool AdminServer::start(const std::string& version,
                         const std::string& channel_file,
-                        uint16_t port) {
+                        uint16_t port,
+                        const std::string& config_path,
+                        const unifi::DbConfig& db) {
   version_ = version;
   channel_file_ = channel_file;
+  config_path_ = config_path;
+  db_ = db;
 
   struct sockaddr_in addr{};
   addr.sin_family = AF_INET;
@@ -506,7 +834,8 @@ bool AdminServer::start(const std::string& version,
   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
   // Leaked Ctx: one per server instance; lives for the program lifetime.
-  auto* ctx = new Ctx{version_.c_str(), channel_file_.c_str()};
+  auto* ctx = new Ctx{version_.c_str(), channel_file_.c_str(),
+                      config_path_.c_str(), &db_};
 
   daemon_ = MHD_start_daemon(
       MHD_USE_INTERNAL_POLLING_THREAD,

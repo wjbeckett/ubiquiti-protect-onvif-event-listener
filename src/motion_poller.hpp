@@ -103,6 +103,10 @@ class MotionPoller {
   void poll_loop();
   void init_high_water_marks();
 
+  // Log the per-camera event-type counts in the last hour.  @p label
+  // is the prefix shown in the log line (e.g. "startup" / "periodic").
+  void log_event_type_breakdown(const char* label);
+
   struct Impl;
   std::unique_ptr<Impl> impl_;
   std::atomic<bool> running_{false};
