@@ -78,6 +78,7 @@ cc_library(
     hdrs = ["src/admin_server.hpp"],
     strip_include_prefix = "src",
     deps = _MHD + [
+        ":dump_sanitizer",
         ":runtime_config",
         ":unifi_camera_config",
         "@com_google_absl//absl/flags:commandlineflag",
@@ -100,6 +101,14 @@ cc_library(
         "@com_google_absl//absl/status:status",
         "@com_google_absl//absl/status:statusor",
     ],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "dump_sanitizer",
+    srcs = ["src/dump_sanitizer.cpp"],
+    hdrs = ["src/dump_sanitizer.hpp"],
+    strip_include_prefix = "src",
     visibility = ["//visibility:public"],
 )
 

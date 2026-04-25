@@ -235,6 +235,14 @@ cc_test(
 )
 
 cc_test(
+    name = "test_dump_sanitizer",
+    srcs = ["test_dump_sanitizer.cpp"],
+    deps = [
+        "//:dump_sanitizer",
+    ],
+)
+
+cc_test(
     name = "test_unifi_camera_config",
     srcs = ["test_unifi_camera_config.cpp"],
     deps = [

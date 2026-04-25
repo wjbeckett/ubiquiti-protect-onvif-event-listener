@@ -41,6 +41,7 @@ typedef int MHD_Result;
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 
+#include "dump_sanitizer.hpp"
 #include "runtime_config.hpp"
 
 namespace onvif {
@@ -981,17 +982,21 @@ absl::Status build_diagnostic_dump(const Ctx& ctx,
     return absl::InternalError("mkdtemp failed");
   const std::string dir = tmpl;
 
-  // Helper: write content to a file inside dir; ignore write errors.
-  auto write = [&dir](const char* name, const std::string& content) {
+  // One sanitiser shared across every file in this dump so a given IP /
+  // credential maps to the same redacted value across files.
+  DumpSanitizer san;
+
+  // Helper: sanitise then write content to a file inside dir.
+  auto write = [&dir, &san](const char* name, const std::string& content) {
     std::ofstream f(dir + "/" + name, std::ios::binary | std::ios::trunc);
-    if (f.is_open()) f << content;
+    if (f.is_open()) f << san.sanitize(content);
   };
-  // Helper: capture the stdout of a shell command into a file.
-  auto capture = [&dir](const char* name, const std::string& cmd) {
+  // Helper: capture the stdout of a shell command into a sanitised file.
+  auto capture = [&dir, &san](const char* name, const std::string& cmd) {
     std::string out;
     run_cmd(cmd, &out);
     std::ofstream f(dir + "/" + name, std::ios::binary | std::ios::trunc);
-    if (f.is_open()) f << out;
+    if (f.is_open()) f << san.sanitize(out);
   };
 
   write("config.json",
@@ -1011,6 +1016,25 @@ absl::Status build_diagnostic_dump(const Ctx& ctx,
           "free -h 2>/dev/null; "
           "echo '---'; "
           "df -h /var /srv 2>/dev/null");
+
+  // Note in the archive that sanitisation was applied -- so a recipient
+  // sees obviously redacted values and knows IP remapping is consistent
+  // within this dump but not across dumps.
+  {
+    std::ofstream f(dir + "/SANITIZED.txt",
+                    std::ios::binary | std::ios::trunc);
+    if (f.is_open()) {
+      f << "This archive was sanitised before tarballing.\n"
+        << "  - IPv4 addresses are remapped via a per-prefix counter\n"
+        << "    (1.1.1.1, 1.1.1.2, 1.1.2.1, ...) so the same source IP\n"
+        << "    maps to the same value across files in this dump.\n"
+        << "  - Usernames, passwords, password digests, nonces, URL\n"
+        << "    credentials, Basic auth headers, and the X-UserId\n"
+        << "    Protect bypass token are replaced with [REDACTED].\n"
+        << "  - The mapping is regenerated for every dump, so values in\n"
+        << "    different archives are NOT comparable.\n";
+    }
+  }
 
   const std::string cmd = "tar czf " + out_path + " -C " + dir + " . "
                           "&& rm -rf " + dir;

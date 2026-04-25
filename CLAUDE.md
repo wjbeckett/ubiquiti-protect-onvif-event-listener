@@ -201,6 +201,223 @@ scripts/bz test --config=x86 //test:all
 > first. If GitHub's SSH connection times out while the hook is running, investigate
 > and resolve the root cause — do not bypass the hook.
 
+## Pre-release verification on a live router
+
+> **MANDATORY before every `git push origin v<X.Y.Z>`.** Every prior breakage
+> caught only after stable promotion (v1.4.3 nginx-injection nesting, v1.4.4
+> `--only-upgrade` dead-end, v1.4.7 CSRF 403) would have surfaced if this
+> runbook had been followed first. A green pass on steps 3–9 below is the
+> precondition for tagging.
+
+The runbook builds a `.deb` locally (without touching apt suites or creating
+a release), deploys to the developer's UDM at `192.168.1.1` via passwordless
+`ssh root@…` (configured per the project's standing setup), exercises every
+in-process feature added since the last verified tag, soaks for an hour to
+catch latent crash/leak/silent-stall regressions, and proves the live
+config-edit-restart loop end-to-end.
+
+Substitute the candidate version (e.g. `1.4.8`) for every `1.4.7` reference.
+Total wall-clock budget: ~90 minutes (~5 min build + ~5 min deploy/smoke +
+60 min soak + ~5 min config flip + final health check).
+
+### 0. Pre-flight
+
+```bash
+git status                                          # clean working tree expected
+scripts/bz test --config=x86 //test:all             # all tests green
+python3 -m cpplint src/*.cpp src/*.hpp test/*.cpp test/*.hpp
+```
+
+If anything is uncommitted that should ship in the candidate, commit + push
+first so the binary we deploy matches `origin/main`.
+
+### 1. Build the .deb locally with explicit version
+
+```bash
+scripts/bz build --config=arm64_release //:onvif_recorder
+scripts/build-deb.sh --arch=arm64 --version=1.4.7
+ls -lh dist/onvif-recorder_1.4.7_arm64.deb
+```
+
+`--version=` overrides the `git describe` derivation so we get a clean
+`1.4.7` package even when the working tree is past the v1.4.6 tag and not
+yet tagged for the candidate. The `arm64_release` build is PGO + ThinLTO.
+
+### 2. Deploy to the router
+
+```bash
+scp dist/onvif-recorder_1.4.7_arm64.deb root@192.168.1.1:/tmp/
+ssh root@192.168.1.1 "dpkg -i /tmp/onvif-recorder_1.4.7_arm64.deb"
+```
+
+Use `dpkg -i` (not `apt-get install`) so apt's downgrade-protection rule
+doesn't refuse to install when the version string is below the current
+remote stable.
+
+### 3. Service-level smoke
+
+```bash
+ssh root@192.168.1.1 '
+  systemctl is-active onvif-recorder &&
+  dpkg-query -W -f="installed: ${Version}\n" onvif-recorder &&
+  ps -fp $(pgrep -x onvif-recorder) | tail -1 &&
+  nginx -t 2>&1 | tail -2
+'
+```
+
+Pass: `active`, `installed: 1.4.7`, the process line shows the
+expected flags from `/etc/default/onvif-recorder.local`, and `nginx -t`
+reports `configuration file … syntax is ok`.
+
+### 4. Endpoint smoke (loopback only — no UniFi auth in shell)
+
+```bash
+ssh root@192.168.1.1 '
+  echo "--- /api/status ---"      ; curl -s http://127.0.0.1:7891/api/status | head -c 400; echo
+  echo "--- /api/camera_health ---"; curl -s http://127.0.0.1:7891/api/camera_health | head -c 600; echo
+  echo "--- /api/recent_events ---"; curl -s http://127.0.0.1:7891/api/recent_events | head -c 600; echo
+  echo "--- /api/config ---"      ; curl -s http://127.0.0.1:7891/api/config | head -c 600; echo
+  echo "--- HEAD admin ---"       ; curl -sI http://127.0.0.1:7891/ | head -1
+  echo "--- log viewer ---"        ; curl -sI http://127.0.0.1:7890/ | head -1
+'
+```
+
+Pass: every endpoint returns `200 OK` with valid JSON. HEAD on admin
+returns `200` (regression check for the v1.4.6 admin HEAD-as-GET fix).
+
+### 5. Diagnostic dump end-to-end (also exercises the sanitiser)
+
+```bash
+ssh root@192.168.1.1 '
+  curl -s -o /tmp/dump.tgz http://127.0.0.1:7891/api/diagnostic_dump &&
+  ls -lh /tmp/dump.tgz &&
+  rm -rf /tmp/dump.x && mkdir /tmp/dump.x && tar -xzf /tmp/dump.tgz -C /tmp/dump.x &&
+  ls /tmp/dump.x &&
+  echo "--- IPs in journal (must all be 1.x.x.x not 192.168.x.x) ---" &&
+  (grep -E "192\.168\.[0-9]+\.[0-9]+" /tmp/dump.x/journal.log | head -3 || echo "(none — sanitised)") &&
+  echo "--- credentials/tokens in journal (count must be 0) ---" &&
+  grep -ciE "password=[^[]|wsse:Password>[^[]" /tmp/dump.x/journal.log
+'
+```
+
+Pass: archive contains `config.json`, `status.json`, `camera_health.json`,
+`journal.log`, `dpkg.txt`, `system.txt`, `SANITIZED.txt`. No `192.168.*`
+IPs in journal (all remapped to `1.x.x.x`). Credential count = 0.
+
+### 6. Camera-health pill correctness
+
+```bash
+ssh root@192.168.1.1 '
+  curl -s http://127.0.0.1:7891/api/camera_health | python3 -m json.tool
+'
+```
+
+Pass: each adopted camera appears once with `is_third_party` set
+correctly. `events_1h` is non-zero on at least one camera that has been
+triggered in the last hour.
+
+### 7. Soak — 1 hour, then re-verify event flow + thumbnails
+
+```bash
+ssh root@192.168.1.1 'logger -t onvif-soak "soak start v1.4.7 $(date -Is)"'
+sleep 3600
+ssh root@192.168.1.1 '
+  echo "--- L1 heartbeats (expect at least one per active camera) ---" &&
+  journalctl -u onvif-recorder --since "1 hour ago" --no-pager |
+    grep -E "alive: events_recv=" | head &&
+  echo "--- L2 hourly aggregate (expect one line) ---" &&
+  journalctl -u onvif-recorder --since "1 hour ago" --no-pager |
+    grep -E "\[recorder\] last 1h:" | head &&
+  echo "--- recent third-party events ---" &&
+  psql -h /run/postgresql -p 5433 -U postgres unifi-protect -c "
+    SELECT type, count(*) FROM events
+    WHERE start > (extract(epoch from now())*1000 - 3600000)::bigint
+      AND \"cameraId\" IN (SELECT id FROM cameras WHERE \"isThirdPartyCamera\"=true)
+    GROUP BY type ORDER BY 2 DESC;" &&
+  echo "--- thumbnails written for those events ---" &&
+  psql -h /run/postgresql -p 5433 -U postgres unifi-protect -c "
+    SELECT count(*) AS thumbs_in_db_last_hour FROM thumbnails t
+    JOIN events e ON e.\"thumbnailId\" = t.id
+    WHERE e.start > (extract(epoch from now())*1000 - 3600000)::bigint;" &&
+  echo "--- MSR-stored thumbnails in last hour ---" &&
+  journalctl -u onvif-recorder --since "1 hour ago" --no-pager |
+    grep -c "MSR stored snapshot"
+'
+```
+
+Pass: at least one L1 heartbeat per active camera (12 in 1h at the 60s
+cadence is the floor); exactly one L2 aggregate (since the hourly window
+just rolled over); at least one third-party event in the last hour; thumb
+table has rows for events that fell on the DB path (or `MSR stored` log
+lines for MSR-routed events).
+
+### 8. Live config edit — flip detect_override on, verify restart + behaviour
+
+```bash
+ssh root@192.168.1.1 '
+  PID_BEFORE=$(pgrep -x onvif-recorder) &&
+  curl -s -X POST -H "Content-Type: application/json" \
+       -d "{\"detect_override\":\"true\"}" \
+       http://127.0.0.1:7891/api/config &&
+  echo &&
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 1
+    PID_NOW=$(pgrep -x onvif-recorder)
+    [ -n "$PID_NOW" ] && [ "$PID_NOW" != "$PID_BEFORE" ] && break
+  done &&
+  echo "--- PID changed from $PID_BEFORE to $PID_NOW ---" &&
+  echo "--- config.json on disk ---" &&
+  cat /etc/onvif-recorder/config.json &&
+  echo "--- new process detect-mode log ---" &&
+  journalctl -u onvif-recorder --since "30 seconds ago" --no-pager |
+    grep -E "\[detect\] (override|fallback) mode" | tail -2
+'
+```
+
+Pass: file contains `"detect_override":"true"`; PID changes; new run logs
+`[detect] override mode: NanoDet-M from /usr/share/onvif-recorder/models`.
+
+Then revert:
+
+```bash
+ssh root@192.168.1.1 '
+  PID_BEFORE=$(pgrep -x onvif-recorder) &&
+  curl -s -X POST -H "Content-Type: application/json" \
+       -d "{\"detect_override\":\"\"}" \
+       http://127.0.0.1:7891/api/config &&
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 1
+    PID_NOW=$(pgrep -x onvif-recorder)
+    [ -n "$PID_NOW" ] && [ "$PID_NOW" != "$PID_BEFORE" ] && break
+  done &&
+  echo "PID $PID_BEFORE -> $PID_NOW" &&
+  journalctl -u onvif-recorder --since "30 seconds ago" --no-pager |
+    grep -E "\[detect\] (override|fallback) mode" | tail -1
+'
+```
+
+Pass: `[detect] fallback mode: NanoDet-M …` (override cleared and the
+unit-file flag is back in effect).
+
+### 9. Final health snapshot
+
+```bash
+ssh root@192.168.1.1 '
+  systemctl is-active onvif-recorder &&
+  journalctl -u onvif-recorder --since "1 hour ago" --no-pager |
+    grep -ciE "error|warn|fatal"
+'
+```
+
+Pass: `active`, error/warn count is bounded (≲ same as before deploy +
+small margin for transient camera errors).
+
+### 10. Tag-and-promote (only after all the above pass)
+
+Proceed to the *Release checklist* section below. **Do not run that
+checklist if any of steps 3–9 failed** — fix root cause, rebuild,
+redeploy, re-soak.
+
 ## Release checklist
 
 > **NON-NEGOTIABLE for every release.** A release without release notes and
