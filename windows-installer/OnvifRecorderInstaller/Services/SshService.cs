@@ -61,6 +61,7 @@ public sealed class SshService {
 
     public async Task<RunResult> RunCaptureAsync(
             Connection c, string script, CancellationToken ct = default) {
+        script = NormalizeLineEndings(script);
         var (client, _) = CreateClient(c);
         using (client) {
             await Task.Run(() => client.Connect(), ct).ConfigureAwait(false);
@@ -86,6 +87,7 @@ public sealed class SshService {
             string script,
             Action<string> onLine,
             CancellationToken ct = default) {
+        script = NormalizeLineEndings(script);
         var (client, _) = CreateClient(c);
         using (client) {
             await Task.Run(() => client.Connect(), ct).ConfigureAwait(false);
@@ -125,6 +127,16 @@ public sealed class SshService {
 
     private sealed class FingerprintHolder {
         public string Value = "";
+    }
+
+    // Bash on the router treats \r as a literal char and barfs on every
+    // line ("$'\r': command not found").  Source files checked out on
+    // Windows have CRLF endings, which C# raw string literals preserve
+    // verbatim — so any script we send needs LF normalisation before
+    // landing on the wire.  Defensive: also handle bare \r.
+    private static string NormalizeLineEndings(string s) {
+        if (string.IsNullOrEmpty(s)) return s;
+        return s.Replace("\r\n", "\n").Replace("\r", "\n");
     }
 
     private static (SshClient, FingerprintHolder) CreateClient(Connection c) {
