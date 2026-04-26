@@ -29,11 +29,13 @@
 namespace onvif {
 
 // Process-global, always-on capture of recent ONVIF SOAP exchanges.  The
-// in-memory ring keeps the most recent 50 000 entries (capped at 256 MiB
-// total to bound worst-case memory on chatty cameras) so that
-// /api/diagnostic_dump can include them without the user having to
-// enable a flag in advance.  --raw_log additionally tees every exchange
-// to a JSONL file for unbounded long-form captures.  Thread-safe.
+// in-memory ring keeps the most recent 50 000 entries, with each entry
+// individually zstd-compressed (level 3) so the in-RAM footprint stays
+// small even for verbose SOAP XML — we typically see ~5x compression,
+// so the 64 MiB compressed cap holds roughly 300+ MiB of raw captures.
+// /api/diagnostic_dump decompresses the entire ring on demand.
+// --raw_log additionally tees every (uncompressed) exchange to a JSONL
+// file for unbounded long-form captures.  Thread-safe.
 class RawSink {
  public:
   static RawSink& instance();
@@ -52,21 +54,32 @@ class RawSink {
               int64_t            response_status,
               const std::string& response);
 
-  // Concatenate every entry currently in the ring as JSONL.  Each entry
-  // is one self-contained JSON object on its own line.  Used by
-  // /api/diagnostic_dump and any test seam that wants to inspect recent
-  // wire activity.
+  // Concatenate every entry currently in the ring as JSONL, decompressing
+  // each entry on the fly.  Each entry is one self-contained JSON object
+  // on its own line.  Used by /api/diagnostic_dump and any test seam
+  // that wants to inspect recent wire activity.
   std::string snapshot() const;
+
+  // Test seams: how many entries are in the ring; how many bytes are
+  // currently held in compressed form.
+  size_t entry_count() const;
+  size_t compressed_bytes() const;
 
  private:
   RawSink() = default;
 
-  static constexpr size_t kMaxEntries = 50000;
-  static constexpr size_t kMaxBytes   = 256 * 1024 * 1024;
+  static constexpr size_t kMaxEntries  = 50000;
+  // 64 MiB cap on COMPRESSED ring size.  At a typical 5x ratio for SOAP
+  // XML this corresponds to ~300 MiB of raw captures — comfortably more
+  // than the 50k entry cap can fill on its own at typical exchange size.
+  static constexpr size_t kMaxBytes    = 64 * 1024 * 1024;
+  // zstd compression level: 3 is the library's default — ~500 MB/s
+  // compress on a single core, ratio comparable to gzip-1.
+  static constexpr int    kZstdLevel   = 3;
 
   mutable std::mutex      mu_;
-  std::deque<std::string> ring_;
-  size_t                  ring_bytes_{0};
+  std::deque<std::string> ring_;          // each element: zstd-compressed JSONL line (no \n)
+  size_t                  ring_bytes_{0};  // sum of compressed sizes
   std::ofstream           disk_;
 };
 

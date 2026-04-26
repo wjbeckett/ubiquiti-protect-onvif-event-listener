@@ -17,7 +17,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-IMAGE="onvif-recorder-builder"
+IMAGE="onvif-recorder-builder:v2"  # bump tag when Dockerfile package list changes
 CACHE_VOL="onvif-recorder-bazel-cache"
 
 # File that records the git commit SHA of the last successful ARM64 Docker build.
@@ -75,6 +75,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fakeroot \
     xz-utils \
     binutils-aarch64-linux-gnu \
+    autoconf \
+    automake \
+    libtool \
+    pkg-config \
+    m4 \
   && pip3 install --break-system-packages cpplint \
   && rm -rf /var/lib/apt/lists/*
 

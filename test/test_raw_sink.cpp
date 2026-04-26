@@ -75,7 +75,7 @@ static void test_record_round_trips_into_snapshot() {
 
 // The ring must hold at least 50000 entries (proves kMaxEntries was
 // actually bumped to 50k and not still at the old 1k value) and never
-// exceed it.  Test pushes 60k tiny records (well under the 256 MiB
+// exceed it.  Test pushes 60k tiny records (well under the 64 MiB
 // byte cap) so the line cap is what's being exercised.
 static void test_ring_caps_entry_count() {
   auto& sink = onvif::RawSink::instance();
@@ -85,6 +85,55 @@ static void test_ring_caps_entry_count() {
   const size_t lines = count_lines(sink.snapshot());
   check(lines >= 50000, "ring keeps last 50000 entries");
   check(lines <= 50000, "ring entry-count cap enforced");
+}
+
+// Pushing realistic SOAP-shaped payloads must produce a smaller in-RAM
+// ring than the same data uncompressed.  This verifies the zstd path is
+// actually compressing rather than passing through raw.  We push enough
+// SOAP records to fully evict any prior test state (>50k entry cap) so
+// the measured ratio reflects only the SOAP payload.
+static void test_ring_compresses_soap_xml() {
+  auto& sink = onvif::RawSink::instance();
+  const std::string soap_request =
+      "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+      "<SOAP-ENV:Envelope xmlns:SOAP-ENV=\"http://www.w3.org/2003/05/soap-envelope\""
+      " xmlns:wsa=\"http://www.w3.org/2005/08/addressing\""
+      " xmlns:tt=\"http://www.onvif.org/ver10/schema\">"
+      "<SOAP-ENV:Header><wsa:Action>"
+      "http://www.onvif.org/ver10/events/wsdl/PullPointSubscription/PullMessages"
+      "</wsa:Action></SOAP-ENV:Header><SOAP-ENV:Body><tt:PullMessages>"
+      "<tt:Timeout>PT60S</tt:Timeout><tt:MessageLimit>1024</tt:MessageLimit>"
+      "</tt:PullMessages></SOAP-ENV:Body></SOAP-ENV:Envelope>";
+  const std::string soap_response =
+      "<SOAP-ENV:Envelope xmlns:SOAP-ENV=\"http://www.w3.org/2003/05/soap-envelope\""
+      " xmlns:tt=\"http://www.onvif.org/ver10/schema\">"
+      "<SOAP-ENV:Body><tt:NotificationMessage>"
+      "<tt:Topic>tns1:RuleEngine/CellMotionDetector/Motion</tt:Topic>"
+      "<tt:Message UtcTime=\"2026-04-26T10:00:00Z\" PropertyOperation=\"Initialized\">"
+      "<tt:Source><tt:SimpleItem Name=\"VideoSourceConfigurationToken\""
+      " Value=\"VideoSource_1\"/></tt:Source>"
+      "<tt:Data><tt:SimpleItem Name=\"IsMotion\" Value=\"true\"/></tt:Data>"
+      "</tt:Message></tt:NotificationMessage></SOAP-ENV:Body></SOAP-ENV:Envelope>";
+
+  // Push more than kMaxEntries (50000) to fully evict any prior
+  // tiny-record state from earlier tests in this binary.
+  for (int i = 0; i < 50100; ++i) {
+    sink.record("192.168.1.42",
+                "http://192.168.1.42/onvif/event_service",
+                "PullMessages",
+                soap_request, 200, soap_response);
+  }
+  const size_t snap_bytes = sink.snapshot().size();
+  const size_t ring_bytes = sink.compressed_bytes();
+
+  // Compressed ring must be strictly smaller than the decompressed
+  // snapshot of the same data.  For SOAP XML, zstd-3 typically yields
+  // > 4x; we assert > 2x to leave headroom for any minor variance.
+  check(ring_bytes * 2 < snap_bytes,
+        "compressed ring at least 2x smaller than decompressed snapshot");
+  // Sanity: snapshot must contain a recognisable XML fragment.
+  check(sink.snapshot().find("CellMotionDetector") != std::string::npos,
+        "snapshot decompresses readable XML");
 }
 
 // enable_disk("") clears any previously-set disk tee but leaves the ring
@@ -141,6 +190,7 @@ int main() {
   test_record_round_trips_into_snapshot();
   test_ring_caps_entry_count();
   test_disk_tee_optional_and_idempotent();
+  test_ring_compresses_soap_xml();
   std::cout << "test_raw_sink: " << g_pass << " passed, "
             << g_fail << " failed\n";
   return g_fail > 0 ? 1 : 0;

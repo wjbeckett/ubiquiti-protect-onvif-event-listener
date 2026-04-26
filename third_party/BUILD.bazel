@@ -300,3 +300,98 @@ cmake(
     },
     visibility = ["//visibility:public"],
 )
+
+# ---- zstd (git submodule: third_party/zstd) ----
+# Used by RawSink (//:onvif_listener) to compress in-memory ring buffer
+# entries.  Static library only; no programs, no shared library.
+cmake(
+    name = "zstd",
+    lib_source = "@zstd_src//:all",
+    working_directory = "build/cmake",
+    out_static_libs = ["libzstd.a"],
+    cache_entries = {
+        "ZSTD_BUILD_PROGRAMS": "OFF",
+        "ZSTD_BUILD_SHARED": "OFF",
+        "ZSTD_BUILD_STATIC": "ON",
+        "ZSTD_BUILD_TESTS": "OFF",
+        "ZSTD_LEGACY_SUPPORT": "OFF",
+        "ZSTD_MULTITHREAD_SUPPORT": "OFF",
+        "CMAKE_INSTALL_LIBDIR": "lib",
+    },
+    visibility = ["//visibility:public"],
+)
+
+cmake(
+    name = "zstd_arm64",
+    lib_source = "@zstd_src//:all",
+    working_directory = "build/cmake",
+    out_static_libs = ["libzstd.a"],
+    cache_entries = {
+        "ZSTD_BUILD_PROGRAMS": "OFF",
+        "ZSTD_BUILD_SHARED": "OFF",
+        "ZSTD_BUILD_STATIC": "ON",
+        "ZSTD_BUILD_TESTS": "OFF",
+        "ZSTD_LEGACY_SUPPORT": "OFF",
+        "ZSTD_MULTITHREAD_SUPPORT": "OFF",
+        "CMAKE_INSTALL_LIBDIR": "lib",
+        "CMAKE_SYSTEM_NAME": "Linux",
+        "CMAKE_SYSTEM_PROCESSOR": "aarch64",
+        "CMAKE_CROSSCOMPILING": "TRUE",
+    },
+    visibility = ["//visibility:public"],
+)
+
+# ---- gperftools tcmalloc (git submodule: third_party/gperftools) ----
+# Builds libtcmalloc_minimal.a only — no heap profiler, heap checker, or
+# CPU profiler — to keep the binary footprint small.  The static library
+# overrides glibc's malloc/calloc/realloc/free via weak-symbol resolution
+# at link time when whole-archive-linked into the binary (see linkopts on
+# //:onvif_recorder).
+# Uses autotools (configure + make) instead of cmake because the cmake
+# build does not bundle/install gperftools' private libcommon.a, leaving
+# tcmalloc_minimal.a with unresolved references to SpinLock,
+# RunningOnValgrind, etc.  Autotools' libtool produces a single fully
+# self-contained libtcmalloc_minimal.a.
+# `targets = ["libtcmalloc_minimal.la", "install-libLTLIBRARIES install-includeHEADERS"]`
+# skips the noinst_PROGRAMS (unit tests + benchmarks) that the default
+# `make all` would otherwise build — tests need bundled gtest which is
+# not wired up under our sandbox and isn't relevant for a library
+# consumer anyway.
+_TCMALLOC_CONFIGURE_OPTS = [
+    "--enable-static",
+    "--disable-shared",
+    "--enable-minimal",
+    "--disable-libunwind",
+    "--disable-debugalloc",
+    "--with-pic",
+]
+_TCMALLOC_TARGETS = [
+    "libtcmalloc_minimal.la",
+    "install-libLTLIBRARIES install-perftoolsincludeHEADERS",
+]
+
+configure_make(
+    name = "tcmalloc",
+    lib_source = "@gperftools_src//:all",
+    autogen = True,
+    configure_in_place = True,
+    configure_options = _TCMALLOC_CONFIGURE_OPTS,
+    targets = _TCMALLOC_TARGETS,
+    out_static_libs = ["libtcmalloc_minimal.a"],
+    visibility = ["//visibility:public"],
+)
+
+configure_make(
+    name = "tcmalloc_arm64",
+    lib_source = "@gperftools_src//:all",
+    autogen = True,
+    configure_in_place = True,
+    # --host tells autotools we're cross-compiling and to skip AC_TRY_RUN
+    # probes that would otherwise execute aarch64 binaries on the x86 host.
+    configure_options = _TCMALLOC_CONFIGURE_OPTS + [
+        "--host=aarch64-linux-gnu",
+    ],
+    targets = _TCMALLOC_TARGETS,
+    out_static_libs = ["libtcmalloc_minimal.a"],
+    visibility = ["//visibility:public"],
+)

@@ -21,6 +21,26 @@ _PQ     = select({"@platforms//cpu:aarch64": ["@arm64_sysroot//:libpq"],
                   "//conditions:default":    ["//third_party:libpq"]})
 _JPEG   = select({"@platforms//cpu:aarch64": ["@arm64_sysroot//:libjpeg"],
                   "//conditions:default":    ["//third_party:libjpeg_turbo"]})
+_ZSTD   = select({"@platforms//cpu:aarch64": ["//third_party:zstd_arm64"],
+                  "//conditions:default":    ["//third_party:zstd"]})
+
+# tcmalloc_minimal — replaces glibc ptmalloc as the process allocator.
+# Linked into //:onvif_recorder only, via the tcmalloc_force_link
+# cc_library wrapper below.  alwayslink = True instructs Bazel to wrap
+# the static .a in --whole-archive on the link line so the
+# malloc/free/calloc/realloc symbols get pulled out and bind ahead of
+# glibc's weak versions (which would otherwise satisfy the references
+# and prevent tcmalloc's .o files from being pulled in at all).
+_TCMALLOC = select({
+    "@platforms//cpu:aarch64": ["//third_party:tcmalloc_arm64"],
+    "//conditions:default":    ["//third_party:tcmalloc"],
+})
+
+cc_library(
+    name = "tcmalloc_force_link",
+    deps = _TCMALLOC,
+    alwayslink = True,
+)
 
 # NCNN dependency: built from source for both x86 and ARM64.
 # ARM64 uses a separate cmake target that sets cross-compilation flags.
@@ -94,7 +114,7 @@ cc_library(
     srcs = ["src/onvif_listener.cpp"],
     hdrs = ["src/onvif_listener.hpp"],
     strip_include_prefix = "src",
-    deps = _CURL + _XML2 + _SSL + [
+    deps = _CURL + _XML2 + _SSL + _ZSTD + [
         ":jpeg_crop",
         ":util",
         "@com_google_absl//absl/log:log",
@@ -295,7 +315,7 @@ cc_binary(
     name = "onvif_recorder",
     srcs = ["src/main.cpp"],
     linkstatic = True,
-    deps = [
+    deps = [":tcmalloc_force_link"] + [
         ":admin_server",
         ":alarm_notifier",
         ":camera_change_log",

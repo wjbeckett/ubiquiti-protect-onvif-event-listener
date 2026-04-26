@@ -27,6 +27,7 @@
 #include <libxml/tree.h>
 #include <libxml/xpath.h>
 #include <libxml/xpathInternals.h>
+#include <zstd.h>
 
 #include <chrono>
 #include <cstdio>
@@ -1045,6 +1046,8 @@ void RawSink::record(const std::string& camera_ip,
                      const std::string& request,
                      int64_t            response_status,
                      const std::string& response) {
+  // Build the JSONL line uncompressed first — it is what we tee to disk
+  // (when --raw_log is set) and what we feed to zstd for the ring entry.
   std::string line;
   line.reserve(request.size() + response.size() + 256);
   line += '{';
@@ -1064,13 +1067,32 @@ void RawSink::record(const std::string& camera_ip,
        +  util::json_str(response);
   line += "}\n";
 
+  // Compress for the in-memory ring.  ZSTD_compressBound is generous
+  // (~roughly +13 bytes on top of input) — covers the worst case where
+  // zstd cannot compress at all (e.g. a tiny line) and falls back to a
+  // raw block.  Done outside the lock so concurrent records don't
+  // serialise on each other through the compressor.
+  std::string compressed;
+  compressed.resize(ZSTD_compressBound(line.size()));
+  const size_t cz = ZSTD_compress(compressed.data(), compressed.size(),
+                                  line.data(),       line.size(),
+                                  kZstdLevel);
+  if (ZSTD_isError(cz)) {
+    // Compression failed (should not happen with a fresh stack buffer of
+    // adequate size, but we still want bounded memory if it does).
+    // Fall back to storing the raw line so the data is preserved.
+    compressed = line;
+  } else {
+    compressed.resize(cz);
+  }
+
   std::lock_guard<std::mutex> lk(mu_);
   if (disk_.is_open()) {
     disk_ << line;
     disk_.flush();
   }
-  ring_bytes_ += line.size();
-  ring_.push_back(std::move(line));
+  ring_bytes_ += compressed.size();
+  ring_.push_back(std::move(compressed));
   while (ring_.size() > kMaxEntries ||
          (ring_bytes_ > kMaxBytes && !ring_.empty())) {
     ring_bytes_ -= ring_.front().size();
@@ -1079,11 +1101,57 @@ void RawSink::record(const std::string& camera_ip,
 }
 
 std::string RawSink::snapshot() const {
-  std::lock_guard<std::mutex> lk(mu_);
+  // Copy the compressed ring under the lock so we can decompress without
+  // holding the recorder lock open across (potentially expensive) zstd
+  // calls.  The cost is one extra std::string copy per entry.
+  std::vector<std::string> copy;
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    copy.reserve(ring_.size());
+    for (const auto& e : ring_) copy.push_back(e);
+  }
+
   std::string out;
-  out.reserve(ring_bytes_);
-  for (const auto& l : ring_) out += l;
+  // Heuristic preallocate: assume ~5x compression ratio.
+  size_t total_compressed = 0;
+  for (const auto& e : copy) total_compressed += e.size();
+  out.reserve(total_compressed * 5);
+
+  for (const auto& e : copy) {
+    // ZSTD_getFrameContentSize tells us the exact decompressed size from
+    // the frame header (we wrote whole single-shot frames in record()).
+    const unsigned long long sz =  // NOLINT(runtime/int)
+        ZSTD_getFrameContentSize(e.data(), e.size());
+    if (sz == ZSTD_CONTENTSIZE_ERROR ||
+        sz == ZSTD_CONTENTSIZE_UNKNOWN) {
+      // Not a zstd frame — must be a raw line preserved by the
+      // compression-failure fallback in record().  Append verbatim.
+      out.append(e);
+      continue;
+    }
+    const size_t before = out.size();
+    out.resize(before + static_cast<size_t>(sz));
+    const size_t dz = ZSTD_decompress(out.data() + before, sz,
+                                      e.data(),            e.size());
+    if (ZSTD_isError(dz)) {
+      // Decompression failed on this entry — drop the partial growth
+      // and skip it rather than letting one bad frame poison the dump.
+      out.resize(before);
+      continue;
+    }
+    out.resize(before + dz);
+  }
   return out;
+}
+
+size_t RawSink::entry_count() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return ring_.size();
+}
+
+size_t RawSink::compressed_bytes() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  return ring_bytes_;
 }
 
 }  // namespace onvif

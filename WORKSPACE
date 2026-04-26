@@ -50,6 +50,18 @@ new_local_repository(
     build_file_content = _FILEGROUP_BUILD,
 )
 
+new_local_repository(
+    name = "zstd_src",
+    path = "third_party/zstd",
+    build_file_content = _FILEGROUP_BUILD,
+)
+
+new_local_repository(
+    name = "gperftools_src",
+    path = "third_party/gperftools",
+    build_file_content = _FILEGROUP_BUILD,
+)
+
 # ---------------------------------------------------------------------------
 # HTTP archive source trees (downloaded by Bazel on first use, SHA-verified).
 # Libraries not hosted on GitHub/GitLab, or whose git history is too large.
