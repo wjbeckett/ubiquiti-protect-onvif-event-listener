@@ -90,17 +90,6 @@ std::string build_sdr_payload(uint64_t ts_ms, const std::string& obj_type) {
 
 }  // namespace motion_poller_internal
 
-// Build a PostgreSQL text-array literal: {"id1","id2","id3"}
-static std::string pg_array(const std::vector<std::string>& ids) {
-  std::string out = "{";
-  for (size_t i = 0; i < ids.size(); ++i) {
-    if (i > 0) out += ',';
-    out += "\"" + ids[i] + "\"";
-  }
-  out += '}';
-  return out;
-}
-
 // ---------------------------------------------------------------------------
 // Implementation struct
 // ---------------------------------------------------------------------------
@@ -307,102 +296,97 @@ void MotionPoller::poll_loop() {
   uint64_t hb_skipped_no_thumb = 0;
   uint64_t hb_skipped_overlap = 0;
 
-  // Pre-build the PostgreSQL array of camera IDs.
-  const std::string cam_arr = pg_array(impl_->camera_ids);
   while (running_.load()) {
     impl_->maybe_reconnect();
 
-    // (D) Count motion events in the same window that WOULD have
-    // matched but were excluded by the NOT EXISTS smartDetectZone
-    // filter.  Lets the journal show "we had candidates but Protect
-    // already classified them" -- otherwise they're invisible.
-    {
-      uint64_t min_hwm_d = UINT64_MAX;
-      for (const auto& [id, h] : impl_->hwm)
-        if (h < min_hwm_d) min_hwm_d = h;
-      if (min_hwm_d == UINT64_MAX) min_hwm_d = util::now_ms() - 3600000ULL;
-      const std::string hwm_str_d = std::to_string(min_hwm_d);
-      const char* params_d[] = { cam_arr.c_str(), hwm_str_d.c_str() };
-      PGresult* res_d = PQexecParams(impl_->conn,
-        "SELECT COUNT(*) FROM events e "
+    // Per-camera poll: each camera gets its own hwm-bounded query.
+    // Earlier versions used a single global query parameterised by
+    // MIN(per-camera hwm), but that caused a livelock — inactive
+    // cameras held the global min back, the LIMIT-50 window filled
+    // with already-processed events from active cameras, and newer
+    // events never reached the loop.  Querying per camera removes
+    // that head-of-line blocking entirely.
+    for (const std::string& cam_id : impl_->camera_ids) {
+      if (!running_.load()) break;
+      impl_->maybe_reconnect();
+
+      auto hwm_it = impl_->hwm.find(cam_id);
+      const uint64_t cam_hwm = (hwm_it != impl_->hwm.end())
+          ? hwm_it->second : (util::now_ms() - 3600000ULL);
+      const std::string hwm_str = std::to_string(cam_hwm);
+      const char* params[] = { cam_id.c_str(), hwm_str.c_str() };
+
+      // (D) Count motion events in the same window that WOULD have
+      // matched but were excluded by the NOT EXISTS smartDetectZone
+      // filter.  Lets the journal show "we had candidates but Protect
+      // already classified them" -- otherwise they're invisible.
+      {
+        PGresult* res_d = PQexecParams(impl_->conn,
+          "SELECT COUNT(*) FROM events e "
+          "WHERE e.type = 'motion' "
+          "  AND e.\"cameraId\" = $1 "
+          "  AND e.start > $2::bigint "
+          "  AND e.\"thumbnailId\" IS NOT NULL "
+          "  AND e.\"end\" IS NOT NULL "
+          "  AND EXISTS ( "
+          "    SELECT 1 FROM events e2 "
+          "    WHERE e2.type = 'smartDetectZone' "
+          "      AND e2.\"cameraId\" = e.\"cameraId\" "
+          "      AND e2.start >= e.start - 5000 "
+          "      AND e2.start <= e.\"end\" + 5000 "
+          "  )",
+          2, nullptr, params, nullptr, nullptr, 0);
+        if (PQresultStatus(res_d) == PGRES_TUPLES_OK &&
+            PQntuples(res_d) > 0) {
+          uint64_t n = static_cast<uint64_t>(
+              std::stoull(PQgetvalue(res_d, 0, 0)));
+          hb_skipped_overlap += n;
+        }
+        PQclear(res_d);
+      }
+
+      PGresult* res = PQexecParams(impl_->conn,
+        "SELECT e.id, e.start, e.\"end\", e.\"cameraId\", e.\"thumbnailId\" "
+        "FROM events e "
         "WHERE e.type = 'motion' "
-        "  AND e.\"cameraId\" = ANY($1) "
+        "  AND e.\"cameraId\" = $1 "
         "  AND e.start > $2::bigint "
         "  AND e.\"thumbnailId\" IS NOT NULL "
         "  AND e.\"end\" IS NOT NULL "
-        "  AND EXISTS ( "
+        "  AND NOT EXISTS ( "
         "    SELECT 1 FROM events e2 "
         "    WHERE e2.type = 'smartDetectZone' "
         "      AND e2.\"cameraId\" = e.\"cameraId\" "
         "      AND e2.start >= e.start - 5000 "
         "      AND e2.start <= e.\"end\" + 5000 "
-        "  )",
-        2, nullptr, params_d, nullptr, nullptr, 0);
-      if (PQresultStatus(res_d) == PGRES_TUPLES_OK &&
-          PQntuples(res_d) > 0) {
-        uint64_t n = static_cast<uint64_t>(
-            std::stoull(PQgetvalue(res_d, 0, 0)));
-        hb_skipped_overlap += n;
+        "  ) "
+        "ORDER BY e.start ASC LIMIT 50",
+        2, nullptr, params, nullptr, nullptr, 0);
+
+      if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        LOG(ERROR) << "[motion_poller] poll query failed (camera "
+                   << cam_id << "): " << PQerrorMessage(impl_->conn);
+        PQclear(res);
+        continue;
       }
-      PQclear(res_d);
-    }
 
-    // Use the minimum hwm across all cameras for the poll query.
-    uint64_t min_hwm = UINT64_MAX;
-    for (const auto& [id, h] : impl_->hwm)
-      if (h < min_hwm) min_hwm = h;
-    if (min_hwm == UINT64_MAX) min_hwm = util::now_ms() - 3600000ULL;
-
-    const std::string hwm_str = std::to_string(min_hwm);
-    const char* params[] = { cam_arr.c_str(), hwm_str.c_str() };
-    PGresult* res = PQexecParams(impl_->conn,
-      "SELECT e.id, e.start, e.\"end\", e.\"cameraId\", e.\"thumbnailId\" "
-      "FROM events e "
-      "WHERE e.type = 'motion' "
-      "  AND e.\"cameraId\" = ANY($1) "
-      "  AND e.start > $2::bigint "
-      "  AND e.\"thumbnailId\" IS NOT NULL "
-      "  AND e.\"end\" IS NOT NULL "
-      "  AND NOT EXISTS ( "
-      "    SELECT 1 FROM events e2 "
-      "    WHERE e2.type = 'smartDetectZone' "
-      "      AND e2.\"cameraId\" = e.\"cameraId\" "
-      "      AND e2.start >= e.start - 5000 "
-      "      AND e2.start <= e.\"end\" + 5000 "
-      "  ) "
-      "ORDER BY e.start ASC LIMIT 50",
-      2, nullptr, params, nullptr, nullptr, 0);
-
-    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-      LOG(ERROR) << "[motion_poller] poll query failed: "
-                 << PQerrorMessage(impl_->conn);
-      PQclear(res);
-      goto sleep;
-    }
-
-    {
       const int nrows = PQntuples(res);
       hb_candidates += static_cast<uint64_t>(nrows);
       if (nrows > 0)
         LOG(INFO) << "[motion_poller] poll returned " << nrows
-                  << " motion event(s) to process";
+                  << " motion event(s) to process for camera " << cam_id;
       for (int i = 0; i < nrows && running_.load(); ++i) {
         const std::string ev_id      = PQgetvalue(res, i, 0);
         const uint64_t    start_ms   =
             static_cast<uint64_t>(std::stoull(PQgetvalue(res, i, 1)));
         const uint64_t    end_ms     =
             static_cast<uint64_t>(std::stoull(PQgetvalue(res, i, 2)));
-        const std::string cam_id     = PQgetvalue(res, i, 3);
+        // cameraId column is redundant (it always matches cam_id from
+        // the outer loop), but keeping it makes the row tuple uniform
+        // with the prior global-query layout — useful when grepping
+        // dumps that span versions.
+        (void)PQgetvalue(res, i, 3);
         const std::string thumb_id   = PQgetvalue(res, i, 4);
-
-        // Skip if already processed (per-camera hwm check).
-        auto hwm_it = impl_->hwm.find(cam_id);
-        if (hwm_it != impl_->hwm.end() && start_ms <= hwm_it->second) {
-          LOG(INFO) << "[motion_poller] skip event " << ev_id
-                    << " (camera " << cam_id
-                    << "): already processed (hwm=" << hwm_it->second << ")";
-          continue;
-        }
 
         LOG(INFO) << "[motion_poller] processing motion event " << ev_id
                   << " camera=" << cam_id << " thumb=" << thumb_id
@@ -614,11 +598,11 @@ void MotionPoller::poll_loop() {
         // Update high-water mark.
         impl_->hwm[cam_id] = start_ms;
       }
-    }
 
-    PQclear(res);
+      PQclear(res);
+    }  // end per-camera loop
 
-  sleep:
+
     // (C) Heartbeat: every kHeartbeatEveryPolls cycles, summarise what
     // happened.  Always fires even when the pipeline is idle so the
     // journal makes "the poller is alive but nothing matched" obvious.
