@@ -43,6 +43,7 @@ typedef int MHD_Result;
 #include "absl/status/status.h"
 
 #include "dump_sanitizer.hpp"
+#include "onvif_listener.hpp"
 #include "runtime_config.hpp"
 
 namespace onvif {
@@ -645,7 +646,6 @@ struct Ctx {
   const unifi::DbConfig* db;  // optional; may have empty conn_string
   const char* protect_url;        // empty if Protect API not available
   const char* protect_user_id;    // empty if no X-UserId discovered
-  const char* raw_log_path;       // value of --raw_log; empty if disabled
   const char* event_log_path;     // value of --event_log; empty if disabled
 };
 
@@ -1023,7 +1023,7 @@ std::pair<int, std::string> handle_config(const Ctx& ctx,
 //   - journal.log        journalctl -u onvif-recorder --since "12 hours ago"
 //   - journal-prev.log   journalctl -u onvif-recorder -b -1 (previous boot)
 //   - service-status.txt systemctl status onvif-recorder
-//   - raw-onvif.jsonl    tail of --raw_log file (last 5000 lines) if set
+//   - raw-onvif.jsonl    in-memory ring of recent SOAP exchanges (always on)
 //   - event-log.jsonl    tail of --event_log file (last 5000 lines) if set
 //   - nginx-error.log    tail of /var/log/nginx/error.log
 //   - dpkg.txt           dpkg-query -W onvif-recorder, unifi-protect, etc.
@@ -1076,16 +1076,13 @@ absl::Status build_diagnostic_dump(const Ctx& ctx,
   capture("nginx-error.log",
           "tail -n 500 /var/log/nginx/error.log 2>/dev/null "
           "|| echo '(nginx error log not readable)'");
-  // Raw ONVIF SOAP exchange log (--raw_log).  Only present if the flag
-  // was set; skipped silently otherwise.  Tail last 5000 lines so the
-  // archive stays small even when the file is hundreds of MB.
-  if (ctx.raw_log_path && ctx.raw_log_path[0] != '\0') {
-    capture("raw-onvif.jsonl",
-            std::string("tail -n 5000 ") + ctx.raw_log_path
-            + " 2>/dev/null || echo '(file not readable: "
-            + ctx.raw_log_path + ")'");
-  }
-  // Parsed-event log (--event_log).  Same treatment as raw_log.
+  // Raw ONVIF SOAP exchange log — sourced from the always-on in-memory
+  // ring (see RawSink in onvif_listener).  No flag required: the dump
+  // always contains the most recent ~1000 exchanges (~8 MiB cap).
+  // --raw_log additionally tees to disk for long-form captures.
+  write("raw-onvif.jsonl", RawSink::instance().snapshot());
+  // Parsed-event log (--event_log) is still file-based; tail last 5000
+  // lines when the flag is set, skip silently otherwise.
   if (ctx.event_log_path && ctx.event_log_path[0] != '\0') {
     capture("event-log.jsonl",
             std::string("tail -n 5000 ") + ctx.event_log_path
@@ -1322,7 +1319,6 @@ bool AdminServer::start(const std::string& version,
                         const unifi::DbConfig& db,
                         const std::string& protect_url,
                         const std::string& protect_user_id,
-                        const std::string& raw_log_path,
                         const std::string& event_log_path) {
   version_ = version;
   channel_file_ = channel_file;
@@ -1330,7 +1326,6 @@ bool AdminServer::start(const std::string& version,
   db_ = db;
   protect_url_ = protect_url;
   protect_user_id_ = protect_user_id;
-  raw_log_path_ = raw_log_path;
   event_log_path_ = event_log_path;
 
   struct sockaddr_in addr{};
@@ -1342,7 +1337,7 @@ bool AdminServer::start(const std::string& version,
   auto* ctx = new Ctx{version_.c_str(), channel_file_.c_str(),
                       config_path_.c_str(), &db_,
                       protect_url_.c_str(), protect_user_id_.c_str(),
-                      raw_log_path_.c_str(), event_log_path_.c_str()};
+                      event_log_path_.c_str()};
 
   daemon_ = MHD_start_daemon(
       MHD_USE_INTERNAL_POLLING_THREAD,

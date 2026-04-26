@@ -106,50 +106,7 @@ std::string utc_now_iso8601() {
 
 
 // -------------------------------------------------------
-// RawRecorder -- thread-safe JSON Lines sink for raw HTTP exchanges
-// -------------------------------------------------------
-class RawRecorder {
- public:
-  static absl::StatusOr<std::unique_ptr<RawRecorder>> Create(
-      const std::string& path) {
-    auto r = std::unique_ptr<RawRecorder>(new RawRecorder(path));
-    if (!r->file_.is_open())
-      return absl::InternalError("Cannot open raw recording file: " + path);
-    return r;
-  }
-
-  // Record one complete request/response exchange.
-  void record(const std::string& camera_ip,
-              const std::string& url,
-              const std::string& soap_action,
-              const std::string& request,
-              int64_t            response_status,
-              const std::string& response) {
-    std::string line;
-    line += '{';
-    line += util::json_str("timestamp") + ':'
-         + util::json_str(util::utc_now_iso8601_ms()) + ',';
-    line += util::json_str("camera_ip")       + ':' + util::json_str(camera_ip)            + ',';
-    line += util::json_str("url")             + ':' + util::json_str(url)                  + ',';
-    line += util::json_str("soap_action")     + ':' + util::json_str(soap_action)          + ',';
-    line += util::json_str("request")         + ':' + util::json_str(request)              + ',';
-    line += util::json_str("response_status") + ':' + std::to_string(response_status)+ ',';
-    line += util::json_str("response")        + ':' + util::json_str(response);
-    line += "}\n";
-
-    std::lock_guard<std::mutex> lk(mu_);
-    file_ << line;
-    file_.flush();
-  }
-
- private:
-  explicit RawRecorder(const std::string& path) {
-    file_.open(path, std::ios::app);
-  }
-
-  std::ofstream file_;
-  std::mutex    mu_;
-};
+// (RawSink is defined in onvif_listener.hpp / implemented further below.)
 
 // -------------------------------------------------------
 // WS-Security UsernameToken (PasswordDigest)
@@ -467,9 +424,8 @@ class CameraWorker {
  public:
   CameraWorker(const CameraConfig& cfg,
                const EventCallback& cb,
-               const std::atomic<bool>& running,
-               RawRecorder* raw)
-    : cfg_(cfg), cb_(cb), running_(running), raw_(raw) {}
+               const std::atomic<bool>& running)
+    : cfg_(cfg), cb_(cb), running_(running) {}
 
   void run() {
     LOG(INFO) << '[' << cfg_.ip << "] started";
@@ -737,9 +693,8 @@ class CameraWorker {
                                             int timeout_sec) {
     auto resp_or = soap_post(url, body, action, timeout_sec);
     if (!resp_or.ok()) return resp_or;
-    if (raw_)
-      raw_->record(cfg_.ip, url, action, body,
-                   resp_or->status_code, resp_or->body);
+    RawSink::instance().record(cfg_.ip, url, action, body,
+                               resp_or->status_code, resp_or->body);
     return resp_or;
   }
 
@@ -951,7 +906,6 @@ class CameraWorker {
   const CameraConfig&       cfg_;
   const EventCallback&      cb_;
   const std::atomic<bool>&  running_;
-  RawRecorder*              raw_;      // nullable; not owned
 };
 
 }  // anonymous namespace
@@ -972,31 +926,18 @@ void OnvifListener::add_camera_live(const CameraConfig& cfg) {
 }
 
 void OnvifListener::enable_raw_recording(const std::string& path) {
-  raw_path_ = path;
+  RawSink::instance().enable_disk(path);
 }
 
 void OnvifListener::run(EventCallback cb) {
   running_ = true;
-
-  // Create raw recorder if a path was configured (lives for the duration of run())
-  std::unique_ptr<RawRecorder> raw_recorder;
-  if (!raw_path_.empty()) {
-    auto raw_or = RawRecorder::Create(raw_path_);
-    if (!raw_or.ok()) {
-      std::cerr << "[onvif] raw recording disabled: "
-                << raw_or.status().message() << '\n';
-    } else {
-      raw_recorder = std::move(*raw_or);
-    }
-  }
-  RawRecorder* raw = raw_recorder.get();  // nullptr when disabled
 
   // Build workers (heap-allocated so their address is stable across moves)
   std::vector<std::unique_ptr<CameraWorker>> workers;
   workers.reserve(cameras_.size());
   for (const auto& cam : cameras_)
     workers.push_back(
-      std::make_unique<CameraWorker>(cam, cb, running_, raw));
+      std::make_unique<CameraWorker>(cam, cb, running_));
 
   // Launch one thread per camera
   std::vector<std::thread> threads;
@@ -1023,7 +964,7 @@ void OnvifListener::run(EventCallback cb) {
       for (auto& cfg : hot_adds) {
         cameras_.push_back(cfg);
         workers.push_back(
-            std::make_unique<CameraWorker>(cfg, cb, running_, raw));
+            std::make_unique<CameraWorker>(cfg, cb, running_));
         CameraWorker* ptr = workers.back().get();
         threads.emplace_back([ptr] { ptr->run(); });
       }
@@ -1076,6 +1017,73 @@ void OnvifListener::run(EventCallback cb) {
 
 void OnvifListener::stop() {
   running_ = false;
+}
+
+// ============================================================
+// RawSink — process-global capture of recent SOAP exchanges
+// ============================================================
+RawSink& RawSink::instance() {
+  static RawSink kInstance;
+  return kInstance;
+}
+
+void RawSink::enable_disk(const std::string& path) {
+  std::lock_guard<std::mutex> lk(mu_);
+  if (disk_.is_open()) disk_.close();
+  if (!path.empty()) {
+    disk_.open(path, std::ios::app);
+    if (!disk_.is_open()) {
+      std::cerr << "[onvif] raw recording to disk disabled: cannot open "
+                << path << '\n';
+    }
+  }
+}
+
+void RawSink::record(const std::string& camera_ip,
+                     const std::string& url,
+                     const std::string& soap_action,
+                     const std::string& request,
+                     int64_t            response_status,
+                     const std::string& response) {
+  std::string line;
+  line.reserve(request.size() + response.size() + 256);
+  line += '{';
+  line += util::json_str("timestamp")       + ':'
+       +  util::json_str(util::utc_now_iso8601_ms()) + ',';
+  line += util::json_str("camera_ip")       + ':'
+       +  util::json_str(camera_ip) + ',';
+  line += util::json_str("url")             + ':'
+       +  util::json_str(url) + ',';
+  line += util::json_str("soap_action")     + ':'
+       +  util::json_str(soap_action) + ',';
+  line += util::json_str("request")         + ':'
+       +  util::json_str(request) + ',';
+  line += util::json_str("response_status") + ':'
+       +  std::to_string(response_status) + ',';
+  line += util::json_str("response")        + ':'
+       +  util::json_str(response);
+  line += "}\n";
+
+  std::lock_guard<std::mutex> lk(mu_);
+  if (disk_.is_open()) {
+    disk_ << line;
+    disk_.flush();
+  }
+  ring_bytes_ += line.size();
+  ring_.push_back(std::move(line));
+  while (ring_.size() > kMaxEntries ||
+         (ring_bytes_ > kMaxBytes && !ring_.empty())) {
+    ring_bytes_ -= ring_.front().size();
+    ring_.pop_front();
+  }
+}
+
+std::string RawSink::snapshot() const {
+  std::lock_guard<std::mutex> lk(mu_);
+  std::string out;
+  out.reserve(ring_bytes_);
+  for (const auto& l : ring_) out += l;
+  return out;
 }
 
 }  // namespace onvif

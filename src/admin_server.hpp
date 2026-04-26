@@ -49,7 +49,6 @@ class AdminServer {
              const unifi::DbConfig& db = unifi::DbConfig{},
              const std::string& protect_url = "",
              const std::string& protect_user_id = "",
-             const std::string& raw_log_path = "",
              const std::string& event_log_path = "");
 
   /// Return the port the server is listening on. Only meaningful after a
@@ -73,7 +72,6 @@ class AdminServer {
   unifi::DbConfig db_;
   std::string protect_url_;
   std::string protect_user_id_;
-  std::string raw_log_path_;
   std::string event_log_path_;
   uint16_t port_{0};
 };

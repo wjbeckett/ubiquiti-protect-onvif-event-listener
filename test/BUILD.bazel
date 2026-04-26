@@ -243,6 +243,14 @@ cc_test(
 )
 
 cc_test(
+    name = "test_raw_sink",
+    srcs = ["test_raw_sink.cpp"],
+    deps = [
+        "//:onvif_listener",
+    ],
+)
+
+cc_test(
     name = "test_unifi_camera_config",
     srcs = ["test_unifi_camera_config.cpp"],
     deps = [

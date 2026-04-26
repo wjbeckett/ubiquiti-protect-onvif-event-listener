@@ -15,6 +15,8 @@
 #pragma once
 
 #include <atomic>
+#include <deque>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <mutex>
@@ -25,6 +27,48 @@
 #include "jpeg_crop.hpp"
 
 namespace onvif {
+
+// Process-global, always-on capture of recent ONVIF SOAP exchanges.  The
+// in-memory ring keeps the most recent 50 000 entries (capped at 256 MiB
+// total to bound worst-case memory on chatty cameras) so that
+// /api/diagnostic_dump can include them without the user having to
+// enable a flag in advance.  --raw_log additionally tees every exchange
+// to a JSONL file for unbounded long-form captures.  Thread-safe.
+class RawSink {
+ public:
+  static RawSink& instance();
+
+  // Tee subsequent exchanges to @p path in append mode.  Failure to open
+  // is logged and ignored; the ring stays active either way.  Idempotent:
+  // calling with an empty string disables the file tee.
+  void enable_disk(const std::string& path);
+
+  // Append one full request/response exchange.  Called from camera
+  // worker threads.
+  void record(const std::string& camera_ip,
+              const std::string& url,
+              const std::string& soap_action,
+              const std::string& request,
+              int64_t            response_status,
+              const std::string& response);
+
+  // Concatenate every entry currently in the ring as JSONL.  Each entry
+  // is one self-contained JSON object on its own line.  Used by
+  // /api/diagnostic_dump and any test seam that wants to inspect recent
+  // wire activity.
+  std::string snapshot() const;
+
+ private:
+  RawSink() = default;
+
+  static constexpr size_t kMaxEntries = 50000;
+  static constexpr size_t kMaxBytes   = 256 * 1024 * 1024;
+
+  mutable std::mutex      mu_;
+  std::deque<std::string> ring_;
+  size_t                  ring_bytes_{0};
+  std::ofstream           disk_;
+};
 
 // ---------------------------------------------------------------
 // Event delivered to the caller via EventCallback
@@ -119,14 +163,11 @@ class OnvifListener {
     /// appear in Protect's database after startup.
     void add_camera_live(const CameraConfig& cfg);
 
-    /// Enable raw HTTP recording. Every SOAP request and its response are
-    /// written as JSON Lines to @p path (one object per exchange). Must be
-    /// called before run(). Disabled when not called.
-    ///
-    /// Each line contains:
-    ///   timestamp, camera_ip, url, soap_action,
-    ///   request  (full SOAP XML string),
-    ///   response_status (HTTP code), response (full SOAP XML string)
+    /// Enable raw HTTP recording to disk.  Every SOAP request and its
+    /// response are appended as JSON Lines to @p path.  The in-memory
+    /// ring buffer (RawSink::instance()) is always active regardless of
+    /// this call; this only adds an on-disk tee for long-form captures.
+    /// Must be called before run().  Pass an empty string to disable.
     void enable_raw_recording(const std::string& path);
 
     /// Spawn one thread per camera. Invoke cb for every received event
@@ -144,7 +185,6 @@ class OnvifListener {
  private:
     std::atomic<bool>         running_{false};
     std::vector<CameraConfig> cameras_;
-    std::string               raw_path_;   // empty = raw recording disabled
 
     // Queue of cameras added via add_camera_live() after run() started.
     // Drained by run()'s supervisor loop under pending_mutex_.
