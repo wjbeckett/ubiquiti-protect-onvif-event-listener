@@ -23,6 +23,16 @@ jobs:
           ref: ${{ github.event.inputs.tag || github.ref }}
           fetch-depth: 0
 
+      # Only the from-source third-party submodules that aren't
+      # available as prebuilt arm64 sysroot packages.  curl / libxml2
+      # / openssl / libjpeg-turbo come from @arm64_sysroot, but
+      # zstd and gperftools (tcmalloc) are always built from source.
+      - name: Init required submodules
+        run: |
+          git submodule update --init --depth 1 \
+              third_party/zstd \
+              third_party/gperftools
+
       - name: Install system deps
         run: |
           sudo apt-get update
