@@ -16,11 +16,11 @@
 
 #include <fstream>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <vector>
 
 #include "absl/status/statusor.h"
+#include "absl/synchronization/mutex.h"
 
 namespace unifi {
 
@@ -60,7 +60,7 @@ class CameraChangeLog {
   explicit CameraChangeLog(const std::string& path);
 
   std::ofstream file_;
-  std::mutex    mu_;
+  absl::Mutex   mu_;
 };
 
 }  // namespace unifi

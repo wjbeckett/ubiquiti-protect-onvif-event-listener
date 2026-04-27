@@ -38,7 +38,6 @@
 #include <iostream>
 #include <map>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -47,6 +46,9 @@
 #include <vector>
 
 #include "absl/log/log.h"
+#include "absl/synchronization/mutex.h"
+
+#include "contention_profiler.hpp"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "util.hpp"
@@ -914,7 +916,10 @@ class CameraWorker {
 // ============================================================
 // OnvifListener public methods
 // ============================================================
-OnvifListener::OnvifListener()  = default;
+OnvifListener::OnvifListener() {
+  ContentionProfiler::instance().register_mutex(
+      &pending_mutex_, "onvif_listener.pending");
+}
 OnvifListener::~OnvifListener() = default;
 
 void OnvifListener::add_camera(const CameraConfig& cfg) {
@@ -922,7 +927,7 @@ void OnvifListener::add_camera(const CameraConfig& cfg) {
 }
 
 void OnvifListener::add_camera_live(const CameraConfig& cfg) {
-  std::lock_guard<std::mutex> lock(pending_mutex_);
+  absl::MutexLock lock(&pending_mutex_);
   pending_cameras_.push_back(cfg);
 }
 
@@ -959,7 +964,7 @@ void OnvifListener::run(EventCallback cb) {
     {
       std::vector<CameraConfig> hot_adds;
       {
-        std::lock_guard<std::mutex> lock(pending_mutex_);
+        absl::MutexLock lock(&pending_mutex_);
         hot_adds.swap(pending_cameras_);
       }
       for (auto& cfg : hot_adds) {
@@ -1023,13 +1028,17 @@ void OnvifListener::stop() {
 // ============================================================
 // RawSink — process-global capture of recent SOAP exchanges
 // ============================================================
+RawSink::RawSink() {
+  ContentionProfiler::instance().register_mutex(&mu_, "raw_sink");
+}
+
 RawSink& RawSink::instance() {
   static RawSink kInstance;
   return kInstance;
 }
 
 void RawSink::enable_disk(const std::string& path) {
-  std::lock_guard<std::mutex> lk(mu_);
+  absl::MutexLock lk(&mu_);
   if (disk_.is_open()) disk_.close();
   if (!path.empty()) {
     disk_.open(path, std::ios::app);
@@ -1086,7 +1095,7 @@ void RawSink::record(const std::string& camera_ip,
     compressed.resize(cz);
   }
 
-  std::lock_guard<std::mutex> lk(mu_);
+  absl::MutexLock lk(&mu_);
   if (disk_.is_open()) {
     disk_ << line;
     disk_.flush();
@@ -1106,7 +1115,7 @@ std::string RawSink::snapshot() const {
   // calls.  The cost is one extra std::string copy per entry.
   std::vector<std::string> copy;
   {
-    std::lock_guard<std::mutex> lk(mu_);
+    absl::MutexLock lk(&mu_);
     copy.reserve(ring_.size());
     for (const auto& e : ring_) copy.push_back(e);
   }
@@ -1145,12 +1154,12 @@ std::string RawSink::snapshot() const {
 }
 
 size_t RawSink::entry_count() const {
-  std::lock_guard<std::mutex> lk(mu_);
+  absl::MutexLock lk(&mu_);
   return ring_.size();
 }
 
 size_t RawSink::compressed_bytes() const {
-  std::lock_guard<std::mutex> lk(mu_);
+  absl::MutexLock lk(&mu_);
   return ring_bytes_;
 }
 

@@ -16,18 +16,20 @@
 
 #include <cstdio>
 #include <cstring>
-#include <mutex>
 #include <string>
 
 #include "absl/log/log_entry.h"
 #include "absl/log/log_sink.h"
 #include "absl/strings/string_view.h"
+#include "absl/synchronization/mutex.h"
 #include "absl/time/time.h"
+#include "contention_profiler.hpp"
 
 namespace onvif {
 
 LogRing::LogRing() {
   std::memset(buf_, 0, kCapacity);
+  ContentionProfiler::instance().register_mutex(&mu_, "log_ring");
 }
 
 void LogRing::Send(const absl::LogEntry& entry) {
@@ -61,7 +63,7 @@ void LogRing::Send(const absl::LogEntry& entry) {
   if (plen < 0) return;
   size_t prefix_len = static_cast<size_t>(plen);
 
-  std::lock_guard<std::mutex> lk(mu_);
+  absl::MutexLock lk(&mu_);
 
   // Write prefix then message into the ring buffer.
   auto write = [&](const char* data, size_t len) {
@@ -84,7 +86,7 @@ void LogRing::Send(const absl::LogEntry& entry) {
 }
 
 std::string LogRing::dump() const {
-  std::lock_guard<std::mutex> lk(mu_);
+  absl::MutexLock lk(&mu_);
   std::string out;
   if (wrapped_) {
     // Old data is from head_ to end, then 0 to head_.

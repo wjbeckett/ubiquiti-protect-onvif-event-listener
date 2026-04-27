@@ -69,6 +69,18 @@ cc_library(
 )
 
 cc_library(
+    name = "contention_profiler",
+    srcs = ["src/contention_profiler.cpp"],
+    hdrs = ["src/contention_profiler.hpp"],
+    strip_include_prefix = "src",
+    deps = [
+        "@com_google_absl//absl/log:log",
+        "@com_google_absl//absl/synchronization:synchronization",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
     name = "log_ring",
     srcs = ["src/log_ring.cpp"],
     hdrs = ["src/log_ring.hpp"],
@@ -76,7 +88,9 @@ cc_library(
     deps = [
         "@com_google_absl//absl/log:log_sink",
         "@com_google_absl//absl/strings:strings",
+        "@com_google_absl//absl/synchronization:synchronization",
         "@com_google_absl//absl/time:time",
+        ":contention_profiler",
     ],
     visibility = ["//visibility:public"],
 )
@@ -97,8 +111,10 @@ cc_library(
     srcs = ["src/admin_server.cpp"],
     hdrs = ["src/admin_server.hpp"],
     strip_include_prefix = "src",
-    deps = _MHD + _CURL + [
+    deps = _MHD + _CURL + _TCMALLOC + [
+        ":contention_profiler",
         ":dump_sanitizer",
+        ":onvif_listener",
         ":runtime_config",
         ":unifi_camera_config",
         "@com_google_absl//absl/flags:commandlineflag",
@@ -115,11 +131,13 @@ cc_library(
     hdrs = ["src/onvif_listener.hpp"],
     strip_include_prefix = "src",
     deps = _CURL + _XML2 + _SSL + _ZSTD + [
+        ":contention_profiler",
         ":jpeg_crop",
         ":util",
         "@com_google_absl//absl/log:log",
         "@com_google_absl//absl/status:status",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/synchronization:synchronization",
     ],
     visibility = ["//visibility:public"],
 )
@@ -153,11 +171,13 @@ cc_library(
     hdrs = ["src/event_recorder.hpp"],
     strip_include_prefix = "src",
     deps = [
+        ":contention_profiler",
         ":onvif_listener",
         ":util",
         "@com_google_absl//absl/log:log",
         "@com_google_absl//absl/status:status",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/synchronization:synchronization",
     ],
     visibility = ["//visibility:public"],
 )
@@ -227,8 +247,10 @@ cc_library(
     hdrs = ["src/alarm_notifier.hpp"],
     strip_include_prefix = "src",
     deps = [
+        ":contention_profiler",
         ":util",
         "@com_google_absl//absl/log:log",
+        "@com_google_absl//absl/synchronization:synchronization",
     ] + _CURL + _PQ,
     visibility = ["//visibility:public"],
 )
@@ -240,6 +262,7 @@ cc_library(
     strip_include_prefix = "src",
     deps = [
         ":alarm_notifier",
+        ":contention_profiler",
         ":jpeg_crop",
         ":msr_client",
         ":object_detect",
@@ -249,6 +272,7 @@ cc_library(
         "@com_google_absl//absl/log:log",
         "@com_google_absl//absl/status:status",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/synchronization:synchronization",
     ] + _CURL + _JPEG + _PQ,
     visibility = ["//visibility:public"],
 )
@@ -259,9 +283,11 @@ cc_library(
     hdrs = ["src/camera_change_log.hpp"],
     strip_include_prefix = "src",
     deps = [
+        ":contention_profiler",
         ":util",
         "@com_google_absl//absl/log:log",
         "@com_google_absl//absl/status:statusor",
+        "@com_google_absl//absl/synchronization:synchronization",
     ],
     visibility = ["//visibility:public"],
 )
@@ -319,6 +345,7 @@ cc_binary(
         ":admin_server",
         ":alarm_notifier",
         ":camera_change_log",
+        ":contention_profiler",
         ":detection_recorder",
         ":event_recorder",
         ":log_ring",

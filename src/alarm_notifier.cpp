@@ -23,11 +23,13 @@
 #include <cinttypes>
 #include <cstdio>
 #include <fstream>
-#include <mutex>
 #include <set>
 #include <string>
 #include <utility>
 #include <vector>
+
+#include "absl/synchronization/mutex.h"
+#include "contention_profiler.hpp"
 
 #include "absl/log/log.h"
 #include "util.hpp"
@@ -436,12 +438,14 @@ AlarmNotifier::AlarmNotifier(std::string protect_url,
                              std::string db_connstr)
     : protect_url_(std::move(protect_url)),
       user_id_(std::move(user_id)),
-      db_connstr_(std::move(db_connstr)) {}  // NOLINT(whitespace/indent_namespace)
+      db_connstr_(std::move(db_connstr)) {
+  ContentionProfiler::instance().register_mutex(&mu_, "alarm_notifier");
+}
 
 void AlarmNotifier::refresh_alarms() {
   std::string url;
   {
-    std::lock_guard<std::mutex> lk(mu_);
+    absl::MutexLock lk(&mu_);
     url = protect_url_;
   }
   const std::string response = http_get(url + "/api/automations");
@@ -465,7 +469,7 @@ void AlarmNotifier::refresh_alarms() {
               << "/" << a.cooldown_ms << "ms";
   }
 
-  std::lock_guard<std::mutex> lk(mu_);
+  absl::MutexLock lk(&mu_);
   automations_  = std::move(parsed);
   last_refresh_ = std::chrono::steady_clock::now();
 }
@@ -478,7 +482,7 @@ void AlarmNotifier::notify(const std::string& obj_type,
   bool need_refresh;
   std::string url;
   {
-    std::lock_guard<std::mutex> lk(mu_);
+    absl::MutexLock lk(&mu_);
     auto now = std::chrono::steady_clock::now();
     need_refresh = automations_.empty() ||
         (now - last_refresh_) > std::chrono::minutes(5);
@@ -488,7 +492,7 @@ void AlarmNotifier::notify(const std::string& obj_type,
 
   std::vector<AutomationEntry> automations_copy;
   {
-    std::lock_guard<std::mutex> lk(mu_);
+    absl::MutexLock lk(&mu_);
     automations_copy = automations_;
     url = protect_url_;
   }
@@ -508,7 +512,7 @@ void AlarmNotifier::notify(const std::string& obj_type,
 
     // Enforce cooldown: skip if last fire was within the cooldown window.
     if (automation.cooldown_enabled && automation.cooldown_ms > 0) {
-      std::lock_guard<std::mutex> lk(mu_);
+      absl::MutexLock lk(&mu_);
       auto it = last_fired_.find(automation.id);
       if (it != last_fired_.end() &&
           (ts_ms - it->second) < automation.cooldown_ms) {
@@ -527,7 +531,7 @@ void AlarmNotifier::notify(const std::string& obj_type,
 
     // Update local cooldown tracker.
     {
-      std::lock_guard<std::mutex> lk(mu_);
+      absl::MutexLock lk(&mu_);
       last_fired_[automation.id] = ts_ms;
     }
   }

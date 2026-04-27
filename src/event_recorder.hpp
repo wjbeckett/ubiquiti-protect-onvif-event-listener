@@ -17,10 +17,10 @@
 
 #include <fstream>
 #include <memory>
-#include <mutex>
 #include <string>
 
 #include "absl/status/statusor.h"
+#include "absl/synchronization/mutex.h"
 #include "onvif_listener.hpp"
 
 namespace onvif {
@@ -43,7 +43,7 @@ class EventRecorder {
   explicit EventRecorder(const std::string& path);
 
   std::ofstream file_;
-  std::mutex    mu_;
+  absl::Mutex   mu_;
 };
 
 }  // namespace onvif

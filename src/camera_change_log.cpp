@@ -22,6 +22,8 @@
 
 #include "absl/log/log.h"
 #include "absl/status/statusor.h"
+#include "absl/synchronization/mutex.h"
+#include "contention_profiler.hpp"
 #include "util.hpp"
 
 namespace unifi {
@@ -64,6 +66,8 @@ static std::string json_read(const std::string& json, const std::string& key) {
 
 CameraChangeLog::CameraChangeLog(const std::string& path) {
   file_.open(path, std::ios::app);
+  onvif::ContentionProfiler::instance().register_mutex(
+      &mu_, "camera_change_log");
 }
 
 absl::StatusOr<std::unique_ptr<CameraChangeLog>> CameraChangeLog::Create(
@@ -90,7 +94,7 @@ void CameraChangeLog::record(const std::string& camera_id,
   line += json_str("new")       + ':' + json_str(new_value);
   line += "}\n";
 
-  std::lock_guard<std::mutex> lk(mu_);
+  absl::MutexLock lk(&mu_);
   file_ << line;
   file_.flush();
 }

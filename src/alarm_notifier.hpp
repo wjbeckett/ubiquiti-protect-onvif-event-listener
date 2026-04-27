@@ -17,10 +17,11 @@
 #include <chrono>
 #include <cstdint>
 #include <map>
-#include <mutex>
 #include <set>
 #include <string>
 #include <vector>
+
+#include "absl/synchronization/mutex.h"
 
 namespace onvif {
 
@@ -94,7 +95,7 @@ class AlarmNotifier {
   std::string protect_url_;
   std::string user_id_;
   std::string db_connstr_;
-  std::mutex mu_;
+  absl::Mutex mu_;
   std::vector<AutomationEntry> automations_;  // protected by mu_
   std::map<std::string, uint64_t> last_fired_;  // automation_id → ms, protected by mu_
   std::chrono::steady_clock::time_point last_refresh_{};

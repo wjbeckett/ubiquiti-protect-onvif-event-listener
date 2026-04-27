@@ -48,6 +48,7 @@
 #include "absl/status/statusor.h"
 #include "absl/log/log_sink_registry.h"
 #include "alarm_notifier.hpp"
+#include "contention_profiler.hpp"
 #include "msr_backfill.hpp"
 #include "msr_client.hpp"
 #include "camera_change_log.hpp"
@@ -311,6 +312,13 @@ static void log_system_info() {
 int main(int argc, char* argv[]) {
   absl::ParseCommandLine(argc, argv);
   absl::InitializeLog();
+
+  // Wire absl's mutex tracer to our per-mutex contention aggregator.
+  // Must run before any absl::Mutex traffic — singletons like
+  // RawSink and the registered classes self-register from their
+  // constructors, but the tracer callback only starts collecting
+  // wait-cycle data once installed.
+  onvif::ContentionProfiler::install();
 
   // Always capture INFO+ messages for the in-memory ring buffer.
   // The stderr threshold controls what the user sees in the terminal.

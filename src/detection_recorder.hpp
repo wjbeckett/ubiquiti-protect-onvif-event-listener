@@ -17,11 +17,12 @@
 #include <deque>
 #include <map>
 #include <memory>
-#include <mutex>
 #include <set>
 #include <string>
 #include <utility>
 #include <vector>
+
+#include "absl/synchronization/mutex.h"
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
@@ -371,7 +372,7 @@ class DetectionRecorder {
       std::unique_ptr<IDbBackend> backend);
 
  private:
-  DetectionRecorder() = default;
+  DetectionRecorder();
 
   struct SnapshotInfo {
     std::string url;
@@ -380,7 +381,7 @@ class DetectionRecorder {
   };
 
   std::unique_ptr<IDbBackend> db_;
-  std::mutex mu_;
+  absl::Mutex mu_;
 
   uint64_t pre_buffer_ms_{2000};   // subtracted from event start timestamp
   uint64_t post_buffer_ms_{2000};  // added to event end timestamp

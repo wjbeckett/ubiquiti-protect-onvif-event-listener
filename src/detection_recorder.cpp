@@ -35,8 +35,10 @@
 
 #include "absl/log/log.h"
 #include "absl/status/status.h"
-#include "util.hpp"
 #include "absl/status/statusor.h"
+#include "absl/synchronization/mutex.h"
+#include "contention_profiler.hpp"
+#include "util.hpp"
 #include "alarm_notifier.hpp"
 #include "jpeg_crop.hpp"
 #include "msr_client.hpp"
@@ -924,6 +926,10 @@ DetectionRecorder::CreateWithBackend(std::unique_ptr<IDbBackend> backend) {
   return dr;
 }
 
+DetectionRecorder::DetectionRecorder() {
+  ContentionProfiler::instance().register_mutex(&mu_, "detection_recorder");
+}
+
 DetectionRecorder::~DetectionRecorder() = default;
 
 void DetectionRecorder::maybe_emit_hourly_stats() {
@@ -954,7 +960,7 @@ void DetectionRecorder::maybe_emit_hourly_stats() {
 }
 
 void DetectionRecorder::set_snapshot(const CameraConfig& cam) {
-  std::lock_guard<std::mutex> lk(mu_);
+  absl::MutexLock lk(&mu_);
   snapshot_info_[cam.ip] = {cam.snapshot_url, cam.user, cam.password};
   db_->register_camera(cam.ip, cam.id, cam.mac);
   if (!cam.id.empty())  camera_ids_[cam.ip]  = cam.id;
@@ -962,50 +968,50 @@ void DetectionRecorder::set_snapshot(const CameraConfig& cam) {
 }
 
 void DetectionRecorder::set_alarm_notifier(AlarmNotifier* notifier) {
-  std::lock_guard<std::mutex> lk(mu_);
+  absl::MutexLock lk(&mu_);
   alarm_notifier_ = notifier;
 }
 
 void DetectionRecorder::set_msr_client(MsrClient* msr) {
-  std::lock_guard<std::mutex> lk(mu_);
+  absl::MutexLock lk(&mu_);
   msr_client_ = msr;
 }
 
 void DetectionRecorder::set_detector(
     const object_detect::ObjectDetector* detector) {
-  std::lock_guard<std::mutex> lk(mu_);
+  absl::MutexLock lk(&mu_);
   detector_ = detector;
 }
 
 void DetectionRecorder::set_detect_override(bool override) {
-  std::lock_guard<std::mutex> lk(mu_);
+  absl::MutexLock lk(&mu_);
   detect_override_ = override;
 }
 
 void DetectionRecorder::set_use_msr_thumbnail_ids(bool use_msr) {
-  std::lock_guard<std::mutex> lk(mu_);
+  absl::MutexLock lk(&mu_);
   use_msr_thumb_ids_ = use_msr;
   if (db_) db_->set_use_msr_thumbnail_ids(use_msr);
 }
 
 void DetectionRecorder::set_buffer(uint32_t pre_sec, uint32_t post_sec) {
-  std::lock_guard<std::mutex> lk(mu_);
+  absl::MutexLock lk(&mu_);
   pre_buffer_ms_  = static_cast<uint64_t>(pre_sec)  * 1000;
   post_buffer_ms_ = static_cast<uint64_t>(post_sec) * 1000;
 }
 
 void DetectionRecorder::set_coalesce_window(uint32_t sec) {
-  std::lock_guard<std::mutex> lk(mu_);
+  absl::MutexLock lk(&mu_);
   coalesce_window_ms_ = static_cast<uint64_t>(sec) * 1000;
 }
 
 void DetectionRecorder::set_max_events_per_hour(uint32_t n) {
-  std::lock_guard<std::mutex> lk(mu_);
+  absl::MutexLock lk(&mu_);
   max_events_per_hour_ = n;
 }
 
 void DetectionRecorder::set_ubv_dir(const std::string& dir) {
-  std::lock_guard<std::mutex> lk(mu_);
+  absl::MutexLock lk(&mu_);
   ubv_dir_ = dir;
   // Create the base directory if it doesn't exist (needed for legacy
   // IP-based flat paths; Protect-native paths create subdirs on demand).
@@ -1027,7 +1033,7 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
   // it is only used as a fallback for cameras that have neither.
   std::string default_obj_type, cam_override_type;
   {
-    std::lock_guard<std::mutex> lk(mu_);
+    absl::MutexLock lk(&mu_);
     if ((ev.topic == "tns1:RuleEngine/FieldDetector/ObjectsInside" ||
          ev.topic == "tns1:UserAlarm/IVA/HumanShapeDetect"         ||
          ev.topic == "tns1:VehicleAlarm/IVB/VehicleDetect"         ||
@@ -1068,7 +1074,7 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     // Non-empty when merging this detection into an existing event row.
     std::string coalesced_event_id;
     {
-      std::lock_guard<std::mutex> lk(mu_);
+      absl::MutexLock lk(&mu_);
 
       // Coalescing: merge into an existing event rather than creating a new one.
       // Two cases:
@@ -1244,7 +1250,7 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
 
     // 4. INSERT into both tables, write thumbnail -- all under lock.
     {
-      std::lock_guard<std::mutex> lk(mu_);
+      absl::MutexLock lk(&mu_);
 
       if (coalesced_event_id.empty()) {
         // New event: insert event row, open it, and record rate-limit timestamp.
@@ -1325,7 +1331,7 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
 
   } else {
     // Detection ended -- UPDATE the open events row with end time + updatedAt.
-    std::lock_guard<std::mutex> lk(mu_);
+    absl::MutexLock lk(&mu_);
     auto it = open_.find(key);
     if (it == open_.end()) return;
 
@@ -1346,7 +1352,7 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
 int DetectionRecorder::coalesce_history(int days) {
   uint64_t coalesce_ms;
   {
-    std::lock_guard<std::mutex> lk(mu_);
+    absl::MutexLock lk(&mu_);
     coalesce_ms = coalesce_window_ms_;
   }
   if (coalesce_ms == 0) return 0;
@@ -1404,13 +1410,13 @@ int DetectionRecorder::purge_stale_open_events(uint64_t older_than_ms) {
 }
 
 void DetectionRecorder::set_default_object_type(const std::string& type) {
-  std::lock_guard<std::mutex> lk(mu_);
+  absl::MutexLock lk(&mu_);
   default_object_type_ = type;
 }
 
 void DetectionRecorder::set_camera_object_type(const std::string& ip,
                                                 const std::string& type) {
-  std::lock_guard<std::mutex> lk(mu_);
+  absl::MutexLock lk(&mu_);
   camera_object_types_[ip] = type;
 }
 

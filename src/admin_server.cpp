@@ -16,6 +16,7 @@
 
 #include <arpa/inet.h>
 #include <curl/curl.h>
+#include <gperftools/malloc_extension.h>
 #include <microhttpd.h>
 #include <netinet/in.h>
 
@@ -42,6 +43,7 @@ typedef int MHD_Result;
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 
+#include "contention_profiler.hpp"
 #include "dump_sanitizer.hpp"
 #include "onvif_listener.hpp"
 #include "runtime_config.hpp"
@@ -1264,6 +1266,20 @@ MHD_Result handler(
       std::remove(tar_path.c_str());
       content_type = "application/gzip";
     }
+  } else if (is_get &&
+             std::strcmp(url, "/api/mallocz") == 0) {
+    // tcmalloc heap stats — direct dump from MallocExtension.
+    // Free; reads atomic counters maintained by the allocator.
+    char buf[16384];
+    MallocExtension::instance()->GetStats(buf, sizeof(buf));
+    body = buf;
+    content_type = "text/plain; charset=utf-8";
+  } else if (is_get &&
+             std::strcmp(url, "/api/contentionz") == 0) {
+    // Per-mutex contention stats from the always-on absl::Mutex
+    // tracer.  Format: fixed-width text table.
+    body = ContentionProfiler::instance().snapshot();
+    content_type = "text/plain; charset=utf-8";
   } else if (is_post) {
     auto* pc = static_cast<PostCtx*>(*con_cls);
     const std::string& pb = pc->body;

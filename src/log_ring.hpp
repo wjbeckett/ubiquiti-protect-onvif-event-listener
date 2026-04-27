@@ -15,10 +15,10 @@
 #pragma once
 
 #include <cstddef>
-#include <mutex>
 #include <string>
 
 #include "absl/log/log_sink.h"
+#include "absl/synchronization/mutex.h"
 
 namespace onvif {
 
@@ -40,7 +40,7 @@ class LogRing : public absl::LogSink {
   std::string dump() const;
 
  private:
-  mutable std::mutex mu_;
+  mutable absl::Mutex mu_;
   char buf_[kCapacity];
   size_t head_{0};   // next write position
   bool wrapped_{false};

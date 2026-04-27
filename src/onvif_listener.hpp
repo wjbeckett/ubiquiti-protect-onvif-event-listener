@@ -19,11 +19,11 @@
 #include <fstream>
 #include <functional>
 #include <map>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
 
+#include "absl/synchronization/mutex.h"
 #include "jpeg_crop.hpp"
 
 namespace onvif {
@@ -66,7 +66,7 @@ class RawSink {
   size_t compressed_bytes() const;
 
  private:
-  RawSink() = default;
+  RawSink();
 
   static constexpr size_t kMaxEntries  = 50000;
   // 64 MiB cap on COMPRESSED ring size.  At a typical 5x ratio for SOAP
@@ -77,7 +77,7 @@ class RawSink {
   // compress on a single core, ratio comparable to gzip-1.
   static constexpr int    kZstdLevel   = 3;
 
-  mutable std::mutex      mu_;
+  mutable absl::Mutex     mu_;
   std::deque<std::string> ring_;          // each element: zstd-compressed JSONL line (no \n)
   size_t                  ring_bytes_{0};  // sum of compressed sizes
   std::ofstream           disk_;
@@ -201,7 +201,7 @@ class OnvifListener {
 
     // Queue of cameras added via add_camera_live() after run() started.
     // Drained by run()'s supervisor loop under pending_mutex_.
-    std::mutex                pending_mutex_;
+    absl::Mutex               pending_mutex_;
     std::vector<CameraConfig> pending_cameras_;
 };
 

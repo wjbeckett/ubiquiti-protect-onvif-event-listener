@@ -15,13 +15,14 @@
 #include "event_recorder.hpp"
 
 #include <memory>
-#include <mutex>
 #include <string>
 #include <utility>
 
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/synchronization/mutex.h"
+#include "contention_profiler.hpp"
 #include "util.hpp"
 
 namespace onvif {
@@ -37,6 +38,7 @@ absl::StatusOr<std::unique_ptr<EventRecorder>> EventRecorder::Create(
 
 EventRecorder::EventRecorder(const std::string& path) {
   file_.open(path, std::ios::app);
+  ContentionProfiler::instance().register_mutex(&mu_, "event_recorder");
 }
 
 void EventRecorder::write(const OnvifEvent& ev) {
@@ -55,7 +57,7 @@ void EventRecorder::write(const OnvifEvent& ev) {
   line += json_str("data")        + ':' + json_obj(ev.data);
   line += "}\n";
 
-  std::lock_guard<std::mutex> lk(mu_);
+  absl::MutexLock lk(&mu_);
   file_ << line;
   file_.flush();
 }
