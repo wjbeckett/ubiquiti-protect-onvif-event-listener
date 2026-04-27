@@ -24,6 +24,7 @@
 #include <string>
 
 #include "motion_poller.hpp"
+#include "object_detect.hpp"
 
 static int g_pass = 0;
 static int g_fail = 0;
@@ -72,7 +73,7 @@ static bool contains(const std::string& haystack, const std::string& needle) {
 static void test_build_sdr_payload_fields() {
   using onvif::motion_poller_internal::build_sdr_payload;
   const uint64_t ts = 1712345678901ULL;
-  std::string j = build_sdr_payload(ts, "vehicle");
+  std::string j = build_sdr_payload(ts, "vehicle", 87);
 
   // Timestamp fields should all carry the ts value.
   check(contains(j, "\"clockStream\":1712345678901"),
@@ -90,9 +91,9 @@ static void test_build_sdr_payload_fields() {
   check(contains(j, "\"objectType\":\"vehicle\""),
         "build_sdr_payload: objectType=vehicle");
 
-  // Fixed structural fields.
-  check(contains(j, "\"confidence\":75"),
-        "build_sdr_payload: confidence=75");
+  // Confidence is now caller-supplied (model output scaled 0-100).
+  check(contains(j, "\"confidence\":87"),
+        "build_sdr_payload: confidence=87 (caller-supplied)");
   check(contains(j, "\"clockStreamRate\":1000"),
         "build_sdr_payload: clockStreamRate=1000");
   check(contains(j, "\"edgeType\":\"none\""),
@@ -105,14 +106,45 @@ static void test_build_sdr_payload_fields() {
 
 static void test_build_sdr_payload_object_type_varies() {
   using onvif::motion_poller_internal::build_sdr_payload;
-  std::string p = build_sdr_payload(1000, "person");
-  std::string a = build_sdr_payload(1000, "animal");
+  std::string p = build_sdr_payload(1000, "person",  50);
+  std::string a = build_sdr_payload(1000, "animal",  50);
+  std::string k = build_sdr_payload(1000, "package", 50);
   check(contains(p, "\"objectType\":\"person\""),
         "build_sdr_payload: objectType=person");
   check(contains(a, "\"objectType\":\"animal\""),
         "build_sdr_payload: objectType=animal");
-  // Same ts → only objectType differs.
-  check(p != a, "build_sdr_payload: object type changes output");
+  check(contains(k, "\"objectType\":\"package\""),
+        "build_sdr_payload: objectType=package");
+  // Same ts + confidence → only objectType differs.
+  check(p != a && a != k && p != k,
+        "build_sdr_payload: object type changes output");
+}
+
+// ---------------------------------------------------------------
+// object_detect::detection_type coverage for the package classes
+// added alongside animal support (see object_detect.hpp).  Lives
+// here rather than its own file because motion_poller is the only
+// consumer of the mapping.
+// ---------------------------------------------------------------
+static void test_detection_type_coco_mapping() {
+  using object_detect::detection_type;
+  using object_detect::is_security_relevant;
+  // Sanity: existing classes still map.
+  check(detection_type(0)  == "person",  "COCO 0  -> person");
+  check(detection_type(2)  == "vehicle", "COCO 2  -> vehicle");
+  check(detection_type(16) == "animal",  "COCO 16 -> animal");
+  // New: backpack/handbag/suitcase -> package.
+  check(detection_type(24) == "package", "COCO 24 (backpack) -> package");
+  check(detection_type(26) == "package", "COCO 26 (handbag)  -> package");
+  check(detection_type(28) == "package", "COCO 28 (suitcase) -> package");
+  // Unrelated class falls back to person.
+  check(detection_type(99) == "person",  "COCO 99 (unknown) -> person fallback");
+  // is_security_relevant must include the new classes.
+  check(is_security_relevant(24), "is_security_relevant(24) backpack");
+  check(is_security_relevant(26), "is_security_relevant(26) handbag");
+  check(is_security_relevant(28), "is_security_relevant(28) suitcase");
+  // And reject unrelated COCO classes.
+  check(!is_security_relevant(50), "is_security_relevant(50) excluded");
 }
 
 int main() {
@@ -120,6 +152,7 @@ int main() {
   test_smart_detect_types_person_default();
   test_build_sdr_payload_fields();
   test_build_sdr_payload_object_type_varies();
+  test_detection_type_coco_mapping();
 
   std::cout << "test_motion_poller: "
             << g_pass << " passed, " << g_fail << " failed\n";

@@ -39,7 +39,15 @@
 namespace object_detect {
 
 // COCO class IDs relevant to security cameras.
-// Caller can filter by these if desired.
+// Caller can filter by these if desired.  Mapped to UniFi Protect
+// smart-detect types via detection_type():
+//   person   <- 0
+//   vehicle  <- 1, 2, 3, 5, 7
+//   animal   <- 14, 15, 16, 17, 18, 19
+//   package  <- 24, 26, 28  (carry-able items the COCO model can detect:
+//                            backpack / handbag / suitcase — best
+//                            available proxy for "package", since
+//                            COCO has no explicit parcel class).
 inline bool is_security_relevant(int class_id) {
   switch (class_id) {
     case 0:   // person
@@ -54,16 +62,24 @@ inline bool is_security_relevant(int class_id) {
     case 17:  // horse
     case 18:  // sheep
     case 19:  // cow
+    case 24:  // backpack
+    case 26:  // handbag
+    case 28:  // suitcase
       return true;
     default:
       return false;
   }
 }
 
-/// Result of a successful detection: bounding box + COCO class ID.
+/// Result of a successful detection: bounding box + COCO class ID +
+/// model confidence in [0, 1].  The same confidence value is fed
+/// downstream into events.score / smartDetectObjects.attributes /
+/// smartDetectRaws.descriptors[].confidence so Protect's UI shows the
+/// real model output instead of a hard-coded value.
 struct Detection {
   jpeg_crop::BoundingBox bbox;
-  int class_id;  // COCO class ID (see is_security_relevant())
+  int   class_id;     // COCO class ID (see is_security_relevant())
+  float confidence;   // [0, 1] from the NanoDet-M head
 };
 
 /// Map a COCO class ID to a UniFi Protect detection type string.
@@ -84,6 +100,10 @@ inline std::string detection_type(int class_id) {
     case 18:  // sheep
     case 19:  // cow
       return "animal";
+    case 24:  // backpack
+    case 26:  // handbag
+    case 28:  // suitcase
+      return "package";
     default:
       return "person";  // 0 = person; also fallback for anything else
   }

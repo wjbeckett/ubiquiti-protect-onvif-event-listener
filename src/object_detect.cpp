@@ -383,7 +383,7 @@ std::optional<Detection> ObjectDetector::detect(
                            h_orig / static_cast<float>(orig_h)));
 
   if (bb.w <= 0.0f || bb.h <= 0.0f) return std::nullopt;
-  return Detection{bb, best->cls};
+  return Detection{bb, best->cls, best->conf};
 #endif  // WITH_NCNN
 }
 

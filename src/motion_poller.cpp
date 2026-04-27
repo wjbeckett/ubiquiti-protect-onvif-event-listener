@@ -16,7 +16,9 @@
 
 #include <libpq-fe.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
@@ -48,8 +50,10 @@ std::string smart_detect_types_json(const std::string& det_type) {
   return "[\"person\"]";
 }
 
-std::string build_sdr_payload(uint64_t ts_ms, const std::string& obj_type) {
+std::string build_sdr_payload(uint64_t ts_ms, const std::string& obj_type,
+                              int confidence) {
   const std::string ts = std::to_string(ts_ms);
+  const std::string conf_str = std::to_string(confidence);
   return
       std::string("{")
       + "\"attributesForTracks\":null,"
@@ -58,7 +62,7 @@ std::string build_sdr_payload(uint64_t ts_ms, const std::string& obj_type) {
       + "\"clockWall\":" + ts + ","
       + "\"descriptors\":[{"
       + "\"attributes\":null,"
-      + "\"confidence\":75,"
+      + "\"confidence\":" + conf_str + ","
       + "\"coord\":[-1.0,-1.0,-1.0,-1.0],"
       + "\"coord3d\":[-1.0,-1.0],"
       + "\"depth\":null,"
@@ -443,11 +447,19 @@ void MotionPoller::poll_loop() {
           LOG(INFO) << "[motion_poller] skip event " << ev_id
                     << ": NanoDet-M detected class_id=" << det->class_id
                     << " which is not security-relevant"
-                    << " (person/vehicle/animal)";
+                    << " (person/vehicle/animal/package)";
           impl_->hwm[cam_id] = start_ms;
           continue;
         }
 
+        // NanoDet-M reports confidence in [0, 1].  UniFi Protect's
+        // events.score / smartDetectObjects.attributes.confidence
+        // schema uses an integer in [0, 100], so scale + clamp here
+        // and reuse for both the SQL parameter and the in-row JSON
+        // blobs we build below.
+        const int confidence = std::max(0, std::min(100,
+            static_cast<int>(std::lround(det->confidence * 100.0f))));
+        const std::string conf_str = std::to_string(confidence);
         const std::string obj_type =
             object_detect::detection_type(det->class_id);
         const std::string sdt_json =
@@ -480,7 +492,8 @@ void MotionPoller::poll_loop() {
           const char* ep[] = {
             new_event_id.c_str(), start_str.c_str(), cam_id.c_str(),
             sdt_json.c_str(), new_thumb_id.c_str(),
-            now_str.c_str(), now_str.c_str(), end_str.c_str()
+            now_str.c_str(), now_str.c_str(), end_str.c_str(),
+            conf_str.c_str()
           };
           impl_->maybe_reconnect();
           PGresult* r = PQexecParams(impl_->conn,
@@ -488,10 +501,10 @@ void MotionPoller::poll_loop() {
             " (id, type, start, \"cameraId\", score, \"smartDetectTypes\","
             "  metadata, locked, \"thumbnailId\", \"createdAt\","
             "  \"updatedAt\", \"end\")"
-            " VALUES ($1, 'smartDetectZone', $2::bigint, $3, 100, $4::json,"
-            "  '{\"source\":\"onvif-recorder\"}'::json, false, $5, $6, $7,"
-            "  $8::bigint)",
-            8, nullptr, ep, nullptr, nullptr, 0);
+            " VALUES ($1, 'smartDetectZone', $2::bigint, $3, $9::int, "
+            "  $4::json, '{\"source\":\"onvif-recorder\"}'::json, false, $5,"
+            "  $6, $7, $8::bigint)",
+            9, nullptr, ep, nullptr, nullptr, 0);
           if (PQresultStatus(r) != PGRES_COMMAND_OK)
             LOG(ERROR) << "[motion_poller] insert event: "
                        << PQerrorMessage(impl_->conn);
@@ -500,10 +513,11 @@ void MotionPoller::poll_loop() {
 
         // INSERT smartDetectObjects.
         {
-          static const char kAttr[] = "{\"confidence\":75}";
+          const std::string attr_json =
+              "{\"confidence\":" + conf_str + "}";
           const char* sp[] = {
             sdo_id.c_str(), new_event_id.c_str(), new_thumb_id.c_str(),
-            cam_id.c_str(), obj_type.c_str(), kAttr,
+            cam_id.c_str(), obj_type.c_str(), attr_json.c_str(),
             ts_str.c_str(), now_str.c_str(), now_str.c_str()
           };
           PGresult* r = PQexecParams(impl_->conn,
@@ -523,7 +537,8 @@ void MotionPoller::poll_loop() {
         // INSERT smartDetectRaws.
         {
           const std::string payload =
-              motion_poller_internal::build_sdr_payload(start_ms, obj_type);
+              motion_poller_internal::build_sdr_payload(
+                  start_ms, obj_type, confidence);
           const char* rp[] = {
             sdr_id.c_str(), cam_id.c_str(), payload.c_str(),
             ts_str.c_str(), now_str.c_str(), now_str.c_str()

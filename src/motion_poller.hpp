@@ -38,7 +38,8 @@ std::string smart_detect_types_json(const std::string& det_type);
 
 /// Build the smartDetectRaws.payload JSON for a single detection at
 /// @p ts_ms with object class @p obj_type.  Exposed for testing.
-std::string build_sdr_payload(uint64_t ts_ms, const std::string& obj_type);
+std::string build_sdr_payload(uint64_t ts_ms, const std::string& obj_type,
+                              int confidence);
 
 }  // namespace motion_poller_internal
 
