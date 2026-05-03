@@ -240,6 +240,12 @@ cc_test(
     ],
 )
 
+sh_test(
+    name = "test_detect_channel",
+    srcs = ["test_detect_channel.sh"],
+    data = ["//:debian/detect-channel.sh"],
+)
+
 cc_test(
     name = "test_runtime_config",
     srcs = ["test_runtime_config.cpp"],

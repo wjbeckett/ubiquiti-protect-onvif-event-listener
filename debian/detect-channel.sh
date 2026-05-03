@@ -25,11 +25,29 @@ set -e
 
 REPO_URL="${ONVIF_REPO_URL:-https://danielwoz.github.io/ubiquiti-protect-onvif-event-listener}"
 CHANNEL_FILE=/etc/onvif-recorder/channel
+PINNED_FILE=/etc/onvif-recorder/channel.pinned
 RUNNABLES=${ONVIF_RUNNABLES_YAML:-/data/unifi-core/config/runnables.yaml}
 
 mkdir -p "$(dirname "$CHANNEL_FILE")"
 if [ ! -f "$CHANNEL_FILE" ]; then
     echo "stable" > "$CHANNEL_FILE"
+fi
+
+# If the user has explicitly chosen a channel via the admin UI, the UI
+# writes a sticky marker.  Respect it: skip auto-detection entirely.
+# (Marker is removed on `apt-get purge`, which is the only documented
+# way to opt back into auto-detection.)
+if [ -f "$PINNED_FILE" ]; then
+    PINNED=$(tr -d '[:space:]' < "$PINNED_FILE")
+    if [ -n "$PINNED" ]; then
+        # Reconcile: ensure the active channel matches the pinned value.
+        if [ "$(cat "$CHANNEL_FILE" 2>/dev/null)" != "$PINNED" ]; then
+            echo "$PINNED" > "$CHANNEL_FILE"
+        fi
+        logger -t onvif-recorder-channel \
+            "channel pinned by user to $PINNED -- skipping auto-detection"
+        exit 0
+    fi
 fi
 
 # Return 0 iff $REPO_URL/dists/$1/Release exists (HTTP 200).

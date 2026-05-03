@@ -748,6 +748,16 @@ std::pair<int, std::string> handle_channel(const Ctx& ctx,
   if (!write_file(ctx.channel_file, channel + "\n")) {
     return {500, std::string("failed to write ") + ctx.channel_file};
   }
+  // Drop a sticky marker recording the user's explicit choice.
+  // detect-channel.sh checks for this and skips overwriting the
+  // channel file on subsequent postinst runs / daily timer runs.
+  // Loss of the marker (e.g. apt purge wiping /etc/onvif-recorder)
+  // is the only path back to auto-detection.
+  std::string pinned_path = std::string(ctx.channel_file) + ".pinned";
+  if (!write_file(pinned_path, channel + "\n")) {
+    LOG(WARNING) << "[channel] failed to write " << pinned_path
+                 << " -- channel may revert on upgrade";
+  }
   std::string out;
   int rc = run_cmd(
       "/usr/libexec/onvif-recorder/install-apt-source.sh && "

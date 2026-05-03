@@ -60,6 +60,11 @@ exports_files(
     visibility = ["//test:__pkg__"],
 )
 
+exports_files(
+    ["debian/detect-channel.sh"],
+    visibility = ["//test:__pkg__"],
+)
+
 cc_library(
     name = "util",
     srcs = ["src/util.cpp"],
