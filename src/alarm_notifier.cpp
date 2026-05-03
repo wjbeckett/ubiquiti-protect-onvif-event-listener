@@ -36,6 +36,9 @@
 
 namespace onvif {
 
+// Forward decl: defined further down, used by AlarmNotifier methods earlier.
+static std::string query_user_id_from_unifi_core();
+
 // ============================================================
 // JSON parsing helpers (file-local)
 // ============================================================
@@ -282,15 +285,17 @@ size_t AlarmNotifier::write_cb(char* ptr, size_t size, size_t nmemb,
   return size * nmemb;
 }
 
-std::string AlarmNotifier::http_get(const std::string& url) {
-  std::string buf;
+long AlarmNotifier::perform_get(const std::string& url,  // NOLINT(runtime/int)
+                                 const std::string& user_id,
+                                 std::string* body) {
+  body->clear();
   CURL* curl = curl_easy_init();
-  if (!curl) return buf;
+  if (!curl) return 0;
 
   struct curl_slist* headers = nullptr;
   headers = curl_slist_append(headers, "Accept: application/json");
   headers = curl_slist_append(headers, "X-Source: unifi-os");
-  std::string user_hdr = "X-UserId: " + user_id_;
+  std::string user_hdr = "X-UserId: " + user_id;
   headers = curl_slist_append(headers, user_hdr.c_str());
 
   curl_easy_setopt(curl, CURLOPT_URL,           url.c_str());
@@ -298,38 +303,34 @@ std::string AlarmNotifier::http_get(const std::string& url) {
   curl_easy_setopt(curl, CURLOPT_NOSIGNAL,       1L);  // NOLINT(runtime/int)
   curl_easy_setopt(curl, CURLOPT_HTTPHEADER,     headers);
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,  write_cb);
-  curl_easy_setopt(curl, CURLOPT_WRITEDATA,      &buf);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA,      body);
 
   const CURLcode rc = curl_easy_perform(curl);
+  long http_code = 0;  // NOLINT(runtime/int)
   if (rc != CURLE_OK) {
     LOG(ERROR) << "[alarm] GET " << url << " failed: " << curl_easy_strerror(rc);
-    buf.clear();
+    body->clear();
   } else {
-    long http_code = 0;  // NOLINT(runtime/int)
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-    if (http_code != 200) {
-      LOG(ERROR) << "[alarm] GET " << url << " HTTP " << http_code;
-      buf.clear();
-    }
   }
-
   curl_slist_free_all(headers);
   curl_easy_cleanup(curl);
-  return buf;
+  return http_code;
 }
 
-void AlarmNotifier::http_post(const std::string& url, const std::string& body) {
+long AlarmNotifier::perform_post(const std::string& url,  // NOLINT(runtime/int)
+                                  const std::string& user_id,
+                                  const std::string& body) {
   CURL* curl = curl_easy_init();
-  if (!curl) return;
+  if (!curl) return 0;
 
   struct curl_slist* headers = nullptr;
   headers = curl_slist_append(headers, "Content-Type: application/json");
   headers = curl_slist_append(headers, "Accept: application/json");
   headers = curl_slist_append(headers, "X-Source: unifi-os");
-  std::string user_hdr = "X-UserId: " + user_id_;
+  std::string user_hdr = "X-UserId: " + user_id;
   headers = curl_slist_append(headers, user_hdr.c_str());
 
-  // Discard response body.
   auto discard = +[](char*, size_t s, size_t n, void*) -> size_t {
     return s * n;
   };
@@ -344,21 +345,110 @@ void AlarmNotifier::http_post(const std::string& url, const std::string& body) {
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,  discard);
 
   const CURLcode rc = curl_easy_perform(curl);
-  if (rc == CURLE_OK) {
-    long http_code = 0;  // NOLINT(runtime/int)
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-    if (http_code < 200 || http_code >= 300) {
-      LOG(ERROR) << "[alarm] POST " << url << " HTTP " << http_code;
-    } else {
-      LOG(INFO) << "[alarm] POST " << url << " → " << http_code;
-    }
-  } else {
+  long http_code = 0;  // NOLINT(runtime/int)
+  if (rc != CURLE_OK) {
     LOG(ERROR) << "[alarm] POST " << url << " failed: "
                << curl_easy_strerror(rc);
+  } else {
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
   }
-
   curl_slist_free_all(headers);
   curl_easy_cleanup(curl);
+  return http_code;
+}
+
+// ============================================================
+// user_id refresh on observed 401
+// ============================================================
+
+bool AlarmNotifier::should_attempt_user_id_refresh(
+    std::chrono::steady_clock::time_point now,
+    std::chrono::steady_clock::time_point last_attempt) {
+  // The default-constructed time_point is the epoch, which compares
+  // less than any real time we'll ever record -- so the first attempt
+  // (last_attempt unset) is always allowed.
+  if (last_attempt == std::chrono::steady_clock::time_point{}) return true;
+  return now - last_attempt >= kUserIdRefreshInterval;
+}
+
+std::string AlarmNotifier::current_user_id() const {
+  // const_cast: mu_ is non-const but we only read here.  We can't make
+  // mu_ mutable without churning every other call site, so this matches
+  // the pattern used elsewhere in this codebase.
+  absl::MutexLock lk(const_cast<absl::Mutex*>(&mu_));
+  return user_id_;
+}
+
+bool AlarmNotifier::try_refresh_user_id() {
+  using clock = std::chrono::steady_clock;
+  {
+    absl::MutexLock lk(&mu_);
+    auto now = clock::now();
+    if (!should_attempt_user_id_refresh(now,
+                                        last_user_id_refresh_attempt_)) {
+      return false;
+    }
+    last_user_id_refresh_attempt_ = now;
+  }
+  // Query the DB outside the lock so we don't hold mu_ across syscalls.
+  std::string fresh = query_user_id_from_unifi_core();
+  if (fresh.empty()) {
+    LOG(WARNING) << "[alarm] user_id refresh attempt found no row in "
+                 << "unifi-core.user_settings; keeping existing value";
+    return false;
+  }
+  bool changed;
+  {
+    absl::MutexLock lk(&mu_);
+    changed = (fresh != user_id_);
+    if (changed) user_id_ = fresh;
+  }
+  if (!changed) {
+    LOG(INFO) << "[alarm] user_id refresh found same value -- "
+              << "401 may not be auth-related";
+    return false;
+  }
+  LOG(WARNING) << "[alarm] user_id rotated; refreshed cache";
+  if (!user_id_cache_path_.empty()) {
+    std::ofstream f(user_id_cache_path_);
+    if (f.is_open()) {
+      f << fresh << '\n';
+    } else {
+      LOG(WARNING) << "[alarm] failed to write " << user_id_cache_path_;
+    }
+  }
+  return true;
+}
+
+std::string AlarmNotifier::http_get(const std::string& url) {
+  std::string user_id = current_user_id();
+  std::string body;
+  long code = perform_get(url, user_id, &body);  // NOLINT(runtime/int)
+  if (code == 401 && try_refresh_user_id()) {
+    LOG(INFO) << "[alarm] retrying GET " << url << " after user_id refresh";
+    code = perform_get(url, current_user_id(), &body);  // NOLINT(runtime/int)
+  }
+  if (code != 200) {
+    if (code != 0)
+      LOG(ERROR) << "[alarm] GET " << url << " HTTP " << code;
+    body.clear();
+  }
+  return body;
+}
+
+void AlarmNotifier::http_post(const std::string& url, const std::string& body) {
+  std::string user_id = current_user_id();
+  long code = perform_post(url, user_id, body);  // NOLINT(runtime/int)
+  if (code == 401 && try_refresh_user_id()) {
+    LOG(INFO) << "[alarm] retrying POST " << url << " after user_id refresh";
+    code = perform_post(url, current_user_id(), body);  // NOLINT(runtime/int)
+  }
+  if (code == 0) return;  // network error already logged
+  if (code < 200 || code >= 300) {
+    LOG(ERROR) << "[alarm] POST " << url << " HTTP " << code;
+  } else {
+    LOG(INFO) << "[alarm] POST " << url << " → " << code;
+  }
 }
 
 // ============================================================
@@ -435,10 +525,12 @@ void AlarmNotifier::record_history(const AutomationEntry& automation,
 
 AlarmNotifier::AlarmNotifier(std::string protect_url,
                              std::string user_id,
-                             std::string db_connstr)
+                             std::string db_connstr,
+                             std::string user_id_cache_path)
     : protect_url_(std::move(protect_url)),
-      user_id_(std::move(user_id)),
-      db_connstr_(std::move(db_connstr)) {
+      db_connstr_(std::move(db_connstr)),
+      user_id_cache_path_(std::move(user_id_cache_path)),
+      user_id_(std::move(user_id)) {
   ContentionProfiler::instance().register_mutex(&mu_, "alarm_notifier");
 }
 
@@ -538,6 +630,31 @@ void AlarmNotifier::notify(const std::string& obj_type,
 }
 
 // ---------------------------------------------------------------------------
+// Query unifi-core for the owner's user_id.  No cache.  Returns "" on
+// any failure (DB unreachable, no user_settings row, etc.).
+// ---------------------------------------------------------------------------
+static std::string query_user_id_from_unifi_core() {
+  PGconn* conn = PQconnectdb(
+      "host=/run/postgresql port=5432 dbname=unifi-core user=postgres");
+  if (PQstatus(conn) != CONNECTION_OK) {
+    LOG(ERROR) << "[alarm] cannot query unifi-core DB: "
+               << PQerrorMessage(conn);
+    PQfinish(conn);
+    return {};
+  }
+  PGresult* res = PQexec(conn,
+      "SELECT user_id FROM user_settings LIMIT 1");
+  std::string user_id;
+  if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
+    user_id = PQgetvalue(res, 0, 0);
+    while (!user_id.empty() && user_id.back() == ' ') user_id.pop_back();
+  }
+  PQclear(res);
+  PQfinish(conn);
+  return user_id;
+}
+
+// ---------------------------------------------------------------------------
 // discover_protect_user_id()
 //
 // Reads the cached user ID from `cache_path`.  If missing, queries the
@@ -562,25 +679,7 @@ std::string discover_protect_user_id(const std::string& cache_path) {
   }
 
   // 2. Query unifi-core DB (port 5432) for the owner's user ID.
-  PGconn* conn = PQconnectdb(
-      "host=/run/postgresql port=5432 dbname=unifi-core user=postgres");
-  if (PQstatus(conn) != CONNECTION_OK) {
-    LOG(ERROR) << "[alarm] cannot discover user ID: unifi-core DB: "
-               << PQerrorMessage(conn);
-    PQfinish(conn);
-    return {};
-  }
-
-  PGresult* res = PQexec(conn,
-      "SELECT user_id FROM user_settings LIMIT 1");
-  std::string user_id;
-  if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
-    user_id = PQgetvalue(res, 0, 0);
-    while (!user_id.empty() && user_id.back() == ' ') user_id.pop_back();
-  }
-  PQclear(res);
-  PQfinish(conn);
-
+  std::string user_id = query_user_id_from_unifi_core();
   if (user_id.empty()) {
     LOG(ERROR) << "[alarm] no user_id found in unifi-core user_settings";
     return {};

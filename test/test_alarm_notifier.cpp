@@ -21,6 +21,7 @@
  * filters, cooldown, and "deleted" entries being dropped.
  */
 
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -36,6 +37,13 @@ struct AlarmNotifierTest {
   static std::vector<AlarmNotifier::AutomationEntry> parse(
       const std::string& json) {
     return AlarmNotifier::parse_automations(json);
+  }
+  static bool should_refresh(std::chrono::steady_clock::time_point now,
+                             std::chrono::steady_clock::time_point last) {
+    return AlarmNotifier::should_attempt_user_id_refresh(now, last);
+  }
+  static std::chrono::seconds refresh_interval() {
+    return AlarmNotifier::kUserIdRefreshInterval;
   }
 };
 
@@ -166,6 +174,46 @@ int main() {
     if (!v.empty()) {
       check(v[0].id == "esc", "escaped-name id extracted");
     }
+  }
+
+  // -------------------------------------------------------------------
+  // user_id refresh rate limiter
+  // -------------------------------------------------------------------
+  using clock = std::chrono::steady_clock;
+  const auto interval = AlarmNotifierTest::refresh_interval();
+
+  // First attempt (last_attempt is the default-constructed zero time)
+  // must always be allowed -- otherwise we'd never recover from a
+  // rotation that happens before the first observed 401.
+  {
+    clock::time_point now = clock::now();
+    clock::time_point never;  // value-initialised: time_point{}
+    check(AlarmNotifierTest::should_refresh(now, never),
+          "rate-limit: zero last_attempt always allows refresh");
+  }
+
+  // Two attempts within the interval: second one is denied.
+  {
+    clock::time_point t0 = clock::now();
+    clock::time_point t1 = t0 + interval / 2;
+    check(!AlarmNotifierTest::should_refresh(t1, t0),
+          "rate-limit: second attempt within interval denied");
+  }
+
+  // Attempt at exactly the interval boundary: allowed.
+  {
+    clock::time_point t0 = clock::now();
+    clock::time_point t1 = t0 + interval;
+    check(AlarmNotifierTest::should_refresh(t1, t0),
+          "rate-limit: attempt at boundary allowed");
+  }
+
+  // Attempt well past the interval: allowed.
+  {
+    clock::time_point t0 = clock::now();
+    clock::time_point t1 = t0 + interval * 5;
+    check(AlarmNotifierTest::should_refresh(t1, t0),
+          "rate-limit: attempt past interval allowed");
   }
 
   std::cerr << "PASS " << g_pass << " / FAIL " << g_fail << '\n';

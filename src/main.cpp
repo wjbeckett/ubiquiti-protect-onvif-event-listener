@@ -466,26 +466,30 @@ int main(int argc, char* argv[]) {
 
   // Discover the Protect API user-id early so the admin server can proxy
   // MSR-stored thumbnails through Protect's local /api/thumbnails/<id>
-  // endpoint.  AlarmNotifier (started later) reuses the same value.
+  // endpoint.  AlarmNotifier (started later) reuses the same value, and
+  // also receives the cache_path so it can self-heal across Protect
+  // user_id rotations (re-discover on 401, persist back to the cache).
   std::string protect_user_id = absl::GetFlag(FLAGS_protect_user_id);
+  const std::string state_dir = absl::GetFlag(FLAGS_state_dir);
+  (void)mkdir(state_dir.c_str(), 0755);
+  const std::string protect_user_id_cache_path =
+      state_dir + "/protect-user-id";
   if (protect_user_id.empty()) {
-    const std::string state_dir = absl::GetFlag(FLAGS_state_dir);
-    (void)mkdir(state_dir.c_str(), 0755);
-    const std::string cache_path = state_dir + "/protect-user-id";
     struct stat st;
-    if (stat(cache_path.c_str(), &st) != 0) {
+    if (stat(protect_user_id_cache_path.c_str(), &st) != 0) {
       const char kLegacyPath[] = "/root/.config/onvif-recorder-api-key";
       std::ifstream in(kLegacyPath, std::ios::binary);
       if (in.is_open()) {
-        std::ofstream out(cache_path, std::ios::binary);
+        std::ofstream out(protect_user_id_cache_path, std::ios::binary);
         if (out.is_open()) {
           out << in.rdbuf();
           LOG(INFO) << "[alarm] migrated cache " << kLegacyPath
-                    << " -> " << cache_path;
+                    << " -> " << protect_user_id_cache_path;
         }
       }
     }
-    protect_user_id = onvif::discover_protect_user_id(cache_path);
+    protect_user_id =
+        onvif::discover_protect_user_id(protect_user_id_cache_path);
   }
 
   // Start the admin page (loopback HTTP, proxied at /onvif/admin/).
@@ -819,7 +823,8 @@ int main(int argc, char* argv[]) {
   std::unique_ptr<onvif::AlarmNotifier> alarm_notifier;
   if (!protect_user_id.empty()) {
     alarm_notifier = std::make_unique<onvif::AlarmNotifier>(
-        absl::GetFlag(FLAGS_protect_url), protect_user_id, db_conn);
+        absl::GetFlag(FLAGS_protect_url), protect_user_id, db_conn,
+        protect_user_id_cache_path);
     alarm_notifier->refresh_alarms();
     det_rec.set_alarm_notifier(alarm_notifier.get());
   } else {
