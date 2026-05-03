@@ -22,21 +22,9 @@
 #include <vector>
 
 #include "absl/synchronization/mutex.h"
+#include "protect_user_id_provider.hpp"
 
 namespace onvif {
-
-/// Read the cached Protect API user ID from `cache_path`, or discover it from
-/// the unifi-core PostgreSQL database and save it back to `cache_path`.
-///
-/// The cache file stores one user_id string per line.  When absent,
-/// discover_protect_user_id() connects to `host=/run/postgresql port=5432
-/// dbname=unifi-core user=postgres` and reads `SELECT user_id FROM
-/// user_settings LIMIT 1`, then writes the result to `cache_path` for
-/// subsequent runs.  The parent directory is created (mkdir 0755) if missing.
-///
-/// Returns the empty string on failure (no cache file, DB unreachable, or no
-/// rows in user_settings).
-std::string discover_protect_user_id(const std::string& cache_path);
 
 /**
  * AlarmNotifier
@@ -50,8 +38,8 @@ std::string discover_protect_user_id(const std::string& cache_path);
  *
  * Usage
  * -----
- *   AlarmNotifier notifier("http://localhost:7080", "user-uuid", db_connstr,
- *                          cache_path);
+ *   ProtectUserIdProvider provider(user_id, cache_path);
+ *   AlarmNotifier notifier("http://localhost:7080", &provider, db_connstr);
  *   notifier.refresh_alarms();
  *
  *   // On each detection event:
@@ -59,18 +47,15 @@ std::string discover_protect_user_id(const std::string& cache_path);
  *
  * Thread-safe: notify() may be called concurrently from multiple camera threads.
  *
- * 401 self-heal: if a Protect API call returns 401 (typically because Protect
- * rotated the user_id during an upgrade), we re-query the unifi-core DB for a
- * fresh user_id, persist it to `user_id_cache_path` if non-empty, and retry
- * the request once.  Re-discovery is rate-limited to one attempt per minute
- * so persistent 401s don't hammer the DB.
+ * 401 self-heal: if a Protect API call returns 401, we ask the shared
+ * ProtectUserIdProvider to re-query unifi-core for a fresh user_id and retry
+ * the request once.  Refresh is rate-limited inside the provider.
  */
 class AlarmNotifier {
  public:
   AlarmNotifier(std::string protect_url,
-                std::string user_id,
-                std::string db_connstr = "",
-                std::string user_id_cache_path = "");
+                ProtectUserIdProvider* user_id_provider,
+                std::string db_connstr = "");
 
   /// Fetch the current automation list from Protect API and cache it.
   void refresh_alarms();
@@ -101,37 +86,16 @@ class AlarmNotifier {
   friend struct AlarmNotifierTest;
 
   std::string protect_url_;
+  ProtectUserIdProvider* user_id_provider_;
   std::string db_connstr_;
-  std::string user_id_cache_path_;
   absl::Mutex mu_;
-  // user_id_ is mutated by try_refresh_user_id() on observed 401s.
-  std::string user_id_;  // protected by mu_
-  std::chrono::steady_clock::time_point last_user_id_refresh_attempt_{};
-  // ^^ protected by mu_
   std::vector<AutomationEntry> automations_;  // protected by mu_
   std::map<std::string, uint64_t> last_fired_;  // automation_id → ms, protected by mu_
   std::chrono::steady_clock::time_point last_refresh_{};
 
-  // Minimum interval between user_id re-discovery attempts.  Prevents
-  // hammering the unifi-core DB on persistent 401s.
-  static constexpr std::chrono::seconds kUserIdRefreshInterval{60};
-
   static std::vector<AutomationEntry> parse_automations(
       const std::string& json);
   static size_t write_cb(char* ptr, size_t size, size_t nmemb, void* userdata);
-
-  // Pure rate-limit predicate.  Returns true iff `now` is at least
-  // kUserIdRefreshInterval past `last_attempt` (or last_attempt is the
-  // default-constructed zero time).  Visible for testing via friend.
-  static bool should_attempt_user_id_refresh(
-      std::chrono::steady_clock::time_point now,
-      std::chrono::steady_clock::time_point last_attempt);
-
-  // Returns the current user_id under mu_.
-  std::string current_user_id() const;
-  // Re-discover user_id from unifi-core (via query_user_id_from_unifi_core).
-  // Rate-limited.  Returns true iff user_id_ was updated.
-  bool try_refresh_user_id();
 
   std::string http_get(const std::string& url);
   void http_post(const std::string& url, const std::string& body);

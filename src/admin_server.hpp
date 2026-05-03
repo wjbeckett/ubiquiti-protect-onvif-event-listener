@@ -23,6 +23,8 @@ struct MHD_Daemon;
 
 namespace onvif {
 
+class ProtectUserIdProvider;
+
 /// Minimal HTTP server that exposes an admin page + JSON API for managing the
 /// onvif-recorder Debian package: force-check-for-updates, switch APT channel,
 /// toggle auto-update, uninstall.
@@ -48,7 +50,7 @@ class AdminServer {
              const std::string& config_path = "/etc/onvif-recorder/config.json",
              const unifi::DbConfig& db = unifi::DbConfig{},
              const std::string& protect_url = "",
-             const std::string& protect_user_id = "",
+             ProtectUserIdProvider* protect_user_id_provider = nullptr,
              const std::string& event_log_path = "");
 
   /// Return the port the server is listening on. Only meaningful after a
@@ -71,7 +73,7 @@ class AdminServer {
   std::string config_path_;
   unifi::DbConfig db_;
   std::string protect_url_;
-  std::string protect_user_id_;
+  ProtectUserIdProvider* protect_user_id_provider_{nullptr};
   std::string event_log_path_;
   uint16_t port_{0};
 };

@@ -33,6 +33,7 @@
 #include "alarm_notifier.hpp"
 #include "jpeg_crop.hpp"
 #include "object_detect.hpp"
+#include "protect_user_id_provider.hpp"
 #include "ubv_thumbnail.hpp"
 #include "util.hpp"
 
@@ -166,21 +167,21 @@ std::string build_sdt_payload(uint64_t start_ms,
 
 namespace {
 
-// GET <protect_url>/api/thumbnails/<id> with X-UserId auth.  Returns
-// the JPEG bytes on 200, or an empty vector on any error / non-200.
-// Mirrors admin_server's fetch_protect_thumbnail.  Used to pull
-// MSR-format (non-24-char) thumbnails that Protect stores as native
-// UBV files served by the msp media server, since those never land
-// in the Postgres `thumbnails` table.
-std::vector<uint8_t> fetch_thumbnail_via_protect(
-    const std::string& base_url,
-    const std::string& user_id,
-    const std::string& thumb_id) {
-  if (base_url.empty() || user_id.empty()) return {};
+// One-shot HTTP GET to the Protect API.  Returns (http_code, body).
+// http_code == 0 indicates a curl-level failure (network/timeout).
+struct ProtectGetResult {
+  long code;  // NOLINT(runtime/int)
+  std::vector<uint8_t> body;
+};
+ProtectGetResult perform_protect_get(const std::string& base_url,
+                                     const std::string& user_id,
+                                     const std::string& thumb_id) {
+  ProtectGetResult out{0, {}};
+  if (base_url.empty() || user_id.empty()) return out;
   const std::string url = base_url + "/api/thumbnails/" + thumb_id;
   std::string buf;
   CURL* curl = curl_easy_init();
-  if (!curl) return {};
+  if (!curl) return out;
   struct curl_slist* hdrs = nullptr;
   const std::string user_hdr = "X-UserId: " + user_id;
   hdrs = curl_slist_append(hdrs, user_hdr.c_str());
@@ -196,12 +197,37 @@ std::vector<uint8_t> fetch_thumbnail_via_protect(
       });
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
   const CURLcode rc = curl_easy_perform(curl);
-  long code = 0;  // NOLINT(runtime/int)
-  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+  if (rc == CURLE_OK) {
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &out.code);
+  }
   curl_slist_free_all(hdrs);
   curl_easy_cleanup(curl);
-  if (rc != CURLE_OK || code != 200) return {};
-  return std::vector<uint8_t>(buf.begin(), buf.end());
+  if (out.code == 200) {
+    out.body.assign(buf.begin(), buf.end());
+  }
+  return out;
+}
+
+// GET <protect_url>/api/thumbnails/<id> with X-UserId auth.  Returns
+// the JPEG bytes on 200, or an empty vector on any error / non-200.
+// Used to pull MSR-format (non-24-char) thumbnails that Protect stores
+// as native UBV files served by the msp media server, since those never
+// land in the Postgres `thumbnails` table.
+//
+// On observed 401, asks the provider to re-discover the user_id and
+// retries the request once with the new value.
+std::vector<uint8_t> fetch_thumbnail_via_protect(
+    const std::string& base_url,
+    ProtectUserIdProvider* provider,
+    const std::string& thumb_id) {
+  if (base_url.empty() || !provider) return {};
+  ProtectGetResult r = perform_protect_get(base_url, provider->current(),
+                                            thumb_id);
+  if (r.code == 401 && provider->try_refresh()) {
+    LOG(INFO) << "[motion_poller] retrying thumbnail GET after user_id refresh";
+    r = perform_protect_get(base_url, provider->current(), thumb_id);
+  }
+  return r.body;
 }
 
 }  // namespace
@@ -218,7 +244,7 @@ struct MotionPoller::Impl {
   AlarmNotifier* alarm_notifier{nullptr};
   std::string ubv_dir;
   std::string protect_url;       // empty = HTTP-fallback disabled
-  std::string protect_user_id;
+  ProtectUserIdProvider* protect_user_id_provider{nullptr};
   int poll_interval_sec{10};
   uint32_t coalesce_window_sec{30};
   bool use_msr_thumb_ids{false};
@@ -299,9 +325,9 @@ void MotionPoller::set_use_msr_thumbnail_ids(bool use_msr) {
 }
 
 void MotionPoller::set_protect_api(const std::string& url,
-                                   const std::string& user_id) {
+                                   ProtectUserIdProvider* provider) {
   impl_->protect_url = url;
-  impl_->protect_user_id = user_id;
+  impl_->protect_user_id_provider = provider;
 }
 
 void MotionPoller::start() {
@@ -540,12 +566,14 @@ void MotionPoller::poll_loop() {
           }
           PQclear(thumb_res);
         } else if (!impl_->protect_url.empty() &&
-                   !impl_->protect_user_id.empty()) {
+                   impl_->protect_user_id_provider &&
+                   !impl_->protect_user_id_provider->empty()) {
           // Non-24-char ID: msp-served UBV thumbnail.  Fetch via
           // Protect's local /api/thumbnails/<id> which dispatches to
-          // msp and returns the JPEG bytes back to us.
+          // msp and returns the JPEG bytes back to us.  401 -> the
+          // provider re-discovers the user_id and we retry once.
           jpeg = fetch_thumbnail_via_protect(
-              impl_->protect_url, impl_->protect_user_id, thumb_id);
+              impl_->protect_url, impl_->protect_user_id_provider, thumb_id);
         }
 
         if (jpeg.empty()) {

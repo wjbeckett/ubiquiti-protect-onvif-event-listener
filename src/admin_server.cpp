@@ -47,6 +47,7 @@ typedef int MHD_Result;
 #include "cpu_profiler.hpp"
 #include "dump_sanitizer.hpp"
 #include "onvif_listener.hpp"
+#include "protect_user_id_provider.hpp"
 #include "runtime_config.hpp"
 
 namespace onvif {
@@ -538,19 +539,21 @@ std::string read_file(const std::string& path) {
   return ss.str();
 }
 
-// GET <protect_url>/api/thumbnails/<id> with X-UserId auth.  Returns the
-// JPEG bytes on 200, or an empty string on any error / non-200.  Used to
-// proxy MSR-stored thumbnails (whose IDs are length != 24 and live as
-// native UBV files served by the Protect msp media server) into the
-// admin UI's <img src="api/thumbnail?id=..."> path.
-std::string fetch_protect_thumbnail(const std::string& protect_url,
-                                     const std::string& user_id,
-                                     const std::string& thumb_id) {
-  if (protect_url.empty() || user_id.empty()) return {};
+// One-shot GET of the Protect thumbnail.  Returns (http_code, body).
+// http_code == 0 indicates a curl-level failure.
+struct ProtectThumbResult {
+  long code;  // NOLINT(runtime/int)
+  std::string body;
+};
+ProtectThumbResult perform_protect_thumb_get(const std::string& protect_url,
+                                              const std::string& user_id,
+                                              const std::string& thumb_id) {
+  ProtectThumbResult out{0, {}};
+  if (protect_url.empty() || user_id.empty()) return out;
   std::string url = protect_url + "/api/thumbnails/" + thumb_id;
   std::string buf;
   CURL* curl = curl_easy_init();
-  if (!curl) return {};
+  if (!curl) return out;
   struct curl_slist* hdrs = nullptr;
   std::string user_hdr = "X-UserId: " + user_id;
   hdrs = curl_slist_append(hdrs, user_hdr.c_str());
@@ -566,12 +569,35 @@ std::string fetch_protect_thumbnail(const std::string& protect_url,
       });
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buf);
   CURLcode rc = curl_easy_perform(curl);
-  long code = 0;  // NOLINT(runtime/int)
-  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+  if (rc == CURLE_OK) {
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &out.code);
+  }
   curl_slist_free_all(hdrs);
   curl_easy_cleanup(curl);
-  if (rc != CURLE_OK || code != 200) return {};
-  return buf;
+  if (out.code == 200) out.body = std::move(buf);
+  return out;
+}
+
+// GET <protect_url>/api/thumbnails/<id> with X-UserId auth.  Returns the
+// JPEG bytes on 200, or an empty string on any error / non-200.  Used to
+// proxy MSR-stored thumbnails (whose IDs are length != 24 and live as
+// native UBV files served by the Protect msp media server) into the
+// admin UI's <img src="api/thumbnail?id=..."> path.
+//
+// On observed 401, asks the provider to refresh the user_id and retries
+// once with the new value.
+std::string fetch_protect_thumbnail(
+    const std::string& protect_url,
+    onvif::ProtectUserIdProvider* provider,
+    const std::string& thumb_id) {
+  if (!provider) return {};
+  ProtectThumbResult r = perform_protect_thumb_get(
+      protect_url, provider->current(), thumb_id);
+  if (r.code == 401 && provider->try_refresh()) {
+    LOG(INFO) << "[admin_server] retrying thumbnail GET after user_id refresh";
+    r = perform_protect_thumb_get(protect_url, provider->current(), thumb_id);
+  }
+  return r.body;
 }
 
 // Write a string atomically to a file: write to .tmp, rename.
@@ -648,7 +674,10 @@ struct Ctx {
   const char* config_path;
   const unifi::DbConfig* db;  // optional; may have empty conn_string
   const char* protect_url;        // empty if Protect API not available
-  const char* protect_user_id;    // empty if no X-UserId discovered
+  // Shared user_id provider used for the thumbnail proxy.  Null if no
+  // X-UserId was discovered at startup.  AdminServer outlives all
+  // pending requests so the pointer remains valid.
+  onvif::ProtectUserIdProvider* protect_user_id_provider;
   const char* event_log_path;     // value of --event_log; empty if disabled
 };
 
@@ -1254,7 +1283,7 @@ MHD_Result handler(
       if (!served) {
         std::string jpeg = fetch_protect_thumbnail(
             ctx->protect_url ? ctx->protect_url : "",
-            ctx->protect_user_id ? ctx->protect_user_id : "",
+            ctx->protect_user_id_provider,
             qs);
         if (!jpeg.empty()) {
           body = std::move(jpeg);
@@ -1351,14 +1380,14 @@ bool AdminServer::start(const std::string& version,
                         const std::string& config_path,
                         const unifi::DbConfig& db,
                         const std::string& protect_url,
-                        const std::string& protect_user_id,
+                        onvif::ProtectUserIdProvider* protect_user_id_provider,
                         const std::string& event_log_path) {
   version_ = version;
   channel_file_ = channel_file;
   config_path_ = config_path;
   db_ = db;
   protect_url_ = protect_url;
-  protect_user_id_ = protect_user_id;
+  protect_user_id_provider_ = protect_user_id_provider;
   event_log_path_ = event_log_path;
 
   struct sockaddr_in addr{};
@@ -1369,7 +1398,7 @@ bool AdminServer::start(const std::string& version,
   // Leaked Ctx: one per server instance; lives for the program lifetime.
   auto* ctx = new Ctx{version_.c_str(), channel_file_.c_str(),
                       config_path_.c_str(), &db_,
-                      protect_url_.c_str(), protect_user_id_.c_str(),
+                      protect_url_.c_str(), protect_user_id_provider_,
                       event_log_path_.c_str()};
 
   daemon_ = MHD_start_daemon(

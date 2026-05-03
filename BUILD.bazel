@@ -133,6 +133,7 @@ cc_library(
         ":cpu_profiler",
         ":dump_sanitizer",
         ":onvif_listener",
+        ":protect_user_id_provider",
         ":runtime_config",
         ":unifi_camera_config",
         "@com_google_absl//absl/flags:commandlineflag",
@@ -266,6 +267,7 @@ cc_library(
     strip_include_prefix = "src",
     deps = [
         ":contention_profiler",
+        ":protect_user_id_provider",
         ":util",
         "@com_google_absl//absl/log:log",
         "@com_google_absl//absl/synchronization:synchronization",
@@ -350,6 +352,18 @@ cc_library(
 )
 
 cc_library(
+    name = "protect_user_id_provider",
+    srcs = ["src/protect_user_id_provider.cpp"],
+    hdrs = ["src/protect_user_id_provider.hpp"],
+    strip_include_prefix = "src",
+    deps = _PQ + [
+        "@com_google_absl//absl/log:log",
+        "@com_google_absl//absl/synchronization:synchronization",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
     name = "motion_poller",
     srcs = ["src/motion_poller.cpp"],
     hdrs = ["src/motion_poller.hpp"],
@@ -358,6 +372,7 @@ cc_library(
         ":alarm_notifier",
         ":jpeg_crop",
         ":object_detect",
+        ":protect_user_id_provider",
         ":ubv_thumbnail",
         ":util",
         "@com_google_absl//absl/log:log",
@@ -387,6 +402,7 @@ cc_binary(
         ":onvif_listener",
         ":patch_watcher",
         ":protect_ui_patch",
+        ":protect_user_id_provider",
         ":runtime_config",
         ":unifi_camera_config",
         ":util",

@@ -70,6 +70,7 @@
 #include "onvif_listener.hpp"
 #include "patch_watcher.hpp"
 #include "protect_ui_patch.hpp"
+#include "protect_user_id_provider.hpp"
 #include "runtime_config.hpp"
 #include "unifi_camera_config.hpp"
 #include "util.hpp"
@@ -491,6 +492,12 @@ int main(int argc, char* argv[]) {
     protect_user_id =
         onvif::discover_protect_user_id(protect_user_id_cache_path);
   }
+  // Single shared provider used by AlarmNotifier, motion_poller and the
+  // admin server's thumbnail proxy.  Owns the user_id and the on-disk
+  // cache, and re-queries unifi-core (rate-limited) when any consumer
+  // observes a 401 from the Protect API.
+  onvif::ProtectUserIdProvider protect_user_id_provider(
+      protect_user_id, protect_user_id_cache_path);
 
   // Start the admin page (loopback HTTP, proxied at /onvif/admin/).
   onvif::AdminServer admin_server;
@@ -499,7 +506,7 @@ int main(int argc, char* argv[]) {
   if (admin_server.start(ONVIF_RECORDER_VERSION, channel_file, admin_port,
                          kConfigPath, cam_db,
                          absl::GetFlag(FLAGS_protect_url),
-                         protect_user_id,
+                         &protect_user_id_provider,
                          event_log)) {
     LOG(INFO) << "[admin_server] listening on 127.0.0.1:" << admin_port;
     auto ng_a = protect_ui::patch_nginx_admin_proxy(admin_port);
@@ -807,7 +814,7 @@ int main(int argc, char* argv[]) {
             static_cast<uint32_t>(absl::GetFlag(FLAGS_coalesce_window_sec)));
         motion_poller->set_use_msr_thumbnail_ids(use_msr_thumb_ids);
         motion_poller->set_protect_api(
-            absl::GetFlag(FLAGS_protect_url), protect_user_id);
+            absl::GetFlag(FLAGS_protect_url), &protect_user_id_provider);
       } else {
         LOG(ERROR) << "[motion_poller] " << mp_or.status().message();
       }
@@ -821,10 +828,9 @@ int main(int argc, char* argv[]) {
   // AlarmNotifier: triggers Protect automations (e.g. chime play) on
   // detections.  user-id was discovered earlier (above admin_server.start).
   std::unique_ptr<onvif::AlarmNotifier> alarm_notifier;
-  if (!protect_user_id.empty()) {
+  if (!protect_user_id_provider.empty()) {
     alarm_notifier = std::make_unique<onvif::AlarmNotifier>(
-        absl::GetFlag(FLAGS_protect_url), protect_user_id, db_conn,
-        protect_user_id_cache_path);
+        absl::GetFlag(FLAGS_protect_url), &protect_user_id_provider, db_conn);
     alarm_notifier->refresh_alarms();
     det_rec.set_alarm_notifier(alarm_notifier.get());
   } else {

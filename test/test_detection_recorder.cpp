@@ -1483,7 +1483,8 @@ static void test_alarm_notify_person() {
   uos.set_alarms_json(kAutomations);
   uos.start();
 
-  onvif::AlarmNotifier notifier(uos.base_url(), "test-user-id");
+  onvif::ProtectUserIdProvider uid("test-user-id", "");
+  onvif::AlarmNotifier notifier(uos.base_url(), &uid);
   notifier.refresh_alarms();
   notifier.notify("person", "AABBCCDDEEFF", "event-uuid-abc", 1234567890000ULL);
 
@@ -1517,7 +1518,8 @@ static void test_alarm_type_filtering() {
   uos.set_alarms_json(kAutomations);
   uos.start();
 
-  onvif::AlarmNotifier notifier(uos.base_url(), "test-user-id");
+  onvif::ProtectUserIdProvider uid("test-user-id", "");
+  onvif::AlarmNotifier notifier(uos.base_url(), &uid);
   notifier.refresh_alarms();
 
   // Person detection → only person automation fires.
@@ -1559,7 +1561,8 @@ static void test_alarm_no_alarms() {
   uos.set_alarms_json("[]");
   uos.start();
 
-  onvif::AlarmNotifier notifier(uos.base_url(), "test-user-id");
+  onvif::ProtectUserIdProvider uid("test-user-id", "");
+  onvif::AlarmNotifier notifier(uos.base_url(), &uid);
   notifier.refresh_alarms();
   notifier.notify("person", "AABBCCDDEEFF", "evt-x", 999ULL);
 
@@ -1573,7 +1576,8 @@ static void test_alarm_no_alarms() {
 // ============================================================
 static void test_alarm_uos_unreachable() {
   // Port 1 is never open for regular users; curl returns ECONNREFUSED immediately.
-  onvif::AlarmNotifier notifier("http://127.0.0.1:1", "test-user-id");
+  onvif::ProtectUserIdProvider uid("test-user-id", "");
+  onvif::AlarmNotifier notifier("http://127.0.0.1:1", &uid);
   notifier.refresh_alarms();  // must not crash
   notifier.notify("person", "AABBCCDDEEFF", "evt-y", 500ULL);  // must not crash
   CHECK(true, "alarm_uos_unreachable: did not crash or hang");
@@ -1600,7 +1604,8 @@ static void test_alarm_integration_e2e(const std::string& ubv_dir) {
   uos.set_alarms_json(kAutomations);
   uos.start();
 
-  onvif::AlarmNotifier notifier(uos.base_url(), "test-user-id");
+  onvif::ProtectUserIdProvider uid("test-user-id", "");
+  onvif::AlarmNotifier notifier(uos.base_url(), &uid);
   notifier.refresh_alarms();
 
   TestContext ctx;
@@ -1775,7 +1780,8 @@ static void test_alarm_notify_animal() {
   uos.set_alarms_json(kAutomations);
   uos.start();
 
-  onvif::AlarmNotifier notifier(uos.base_url(), "test-user-id");
+  onvif::ProtectUserIdProvider uid("test-user-id", "");
+  onvif::AlarmNotifier notifier(uos.base_url(), &uid);
   notifier.refresh_alarms();
 
   // Animal detection → only animal automation fires.

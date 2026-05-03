@@ -298,6 +298,14 @@ cc_test(
 )
 
 cc_test(
+    name = "test_protect_user_id_provider",
+    srcs = ["test_protect_user_id_provider.cpp"],
+    deps = [
+        "//:protect_user_id_provider",
+    ],
+)
+
+cc_test(
     name = "test_admin_server",
     srcs = ["test_admin_server.cpp"],
     deps = [

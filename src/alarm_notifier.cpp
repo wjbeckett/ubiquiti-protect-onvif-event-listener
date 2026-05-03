@@ -15,7 +15,6 @@
 #include "alarm_notifier.hpp"
 
 #include <curl/curl.h>
-#include <sys/stat.h>
 
 #include <libpq-fe.h>
 
@@ -35,9 +34,6 @@
 #include "util.hpp"
 
 namespace onvif {
-
-// Forward decl: defined further down, used by AlarmNotifier methods earlier.
-static std::string query_user_id_from_unifi_core();
 
 // ============================================================
 // JSON parsing helpers (file-local)
@@ -357,76 +353,12 @@ long AlarmNotifier::perform_post(const std::string& url,  // NOLINT(runtime/int)
   return http_code;
 }
 
-// ============================================================
-// user_id refresh on observed 401
-// ============================================================
-
-bool AlarmNotifier::should_attempt_user_id_refresh(
-    std::chrono::steady_clock::time_point now,
-    std::chrono::steady_clock::time_point last_attempt) {
-  // The default-constructed time_point is the epoch, which compares
-  // less than any real time we'll ever record -- so the first attempt
-  // (last_attempt unset) is always allowed.
-  if (last_attempt == std::chrono::steady_clock::time_point{}) return true;
-  return now - last_attempt >= kUserIdRefreshInterval;
-}
-
-std::string AlarmNotifier::current_user_id() const {
-  // const_cast: mu_ is non-const but we only read here.  We can't make
-  // mu_ mutable without churning every other call site, so this matches
-  // the pattern used elsewhere in this codebase.
-  absl::MutexLock lk(const_cast<absl::Mutex*>(&mu_));
-  return user_id_;
-}
-
-bool AlarmNotifier::try_refresh_user_id() {
-  using clock = std::chrono::steady_clock;
-  {
-    absl::MutexLock lk(&mu_);
-    auto now = clock::now();
-    if (!should_attempt_user_id_refresh(now,
-                                        last_user_id_refresh_attempt_)) {
-      return false;
-    }
-    last_user_id_refresh_attempt_ = now;
-  }
-  // Query the DB outside the lock so we don't hold mu_ across syscalls.
-  std::string fresh = query_user_id_from_unifi_core();
-  if (fresh.empty()) {
-    LOG(WARNING) << "[alarm] user_id refresh attempt found no row in "
-                 << "unifi-core.user_settings; keeping existing value";
-    return false;
-  }
-  bool changed;
-  {
-    absl::MutexLock lk(&mu_);
-    changed = (fresh != user_id_);
-    if (changed) user_id_ = fresh;
-  }
-  if (!changed) {
-    LOG(INFO) << "[alarm] user_id refresh found same value -- "
-              << "401 may not be auth-related";
-    return false;
-  }
-  LOG(WARNING) << "[alarm] user_id rotated; refreshed cache";
-  if (!user_id_cache_path_.empty()) {
-    std::ofstream f(user_id_cache_path_);
-    if (f.is_open()) {
-      f << fresh << '\n';
-    } else {
-      LOG(WARNING) << "[alarm] failed to write " << user_id_cache_path_;
-    }
-  }
-  return true;
-}
-
 std::string AlarmNotifier::http_get(const std::string& url) {
-  std::string user_id = current_user_id();
   std::string body;
-  long code = perform_get(url, user_id, &body);  // NOLINT(runtime/int)
-  if (code == 401 && try_refresh_user_id()) {
+  long code = perform_get(url, user_id_provider_->current(), &body);  // NOLINT(runtime/int)
+  if (code == 401 && user_id_provider_->try_refresh()) {
     LOG(INFO) << "[alarm] retrying GET " << url << " after user_id refresh";
-    code = perform_get(url, current_user_id(), &body);  // NOLINT(runtime/int)
+    code = perform_get(url, user_id_provider_->current(), &body);  // NOLINT(runtime/int)
   }
   if (code != 200) {
     if (code != 0)
@@ -437,11 +369,10 @@ std::string AlarmNotifier::http_get(const std::string& url) {
 }
 
 void AlarmNotifier::http_post(const std::string& url, const std::string& body) {
-  std::string user_id = current_user_id();
-  long code = perform_post(url, user_id, body);  // NOLINT(runtime/int)
-  if (code == 401 && try_refresh_user_id()) {
+  long code = perform_post(url, user_id_provider_->current(), body);  // NOLINT(runtime/int)
+  if (code == 401 && user_id_provider_->try_refresh()) {
     LOG(INFO) << "[alarm] retrying POST " << url << " after user_id refresh";
-    code = perform_post(url, current_user_id(), body);  // NOLINT(runtime/int)
+    code = perform_post(url, user_id_provider_->current(), body);  // NOLINT(runtime/int)
   }
   if (code == 0) return;  // network error already logged
   if (code < 200 || code >= 300) {
@@ -524,13 +455,11 @@ void AlarmNotifier::record_history(const AutomationEntry& automation,
 // ============================================================
 
 AlarmNotifier::AlarmNotifier(std::string protect_url,
-                             std::string user_id,
-                             std::string db_connstr,
-                             std::string user_id_cache_path)
+                             ProtectUserIdProvider* user_id_provider,
+                             std::string db_connstr)
     : protect_url_(std::move(protect_url)),
-      db_connstr_(std::move(db_connstr)),
-      user_id_cache_path_(std::move(user_id_cache_path)),
-      user_id_(std::move(user_id)) {
+      user_id_provider_(user_id_provider),
+      db_connstr_(std::move(db_connstr)) {
   ContentionProfiler::instance().register_mutex(&mu_, "alarm_notifier");
 }
 
@@ -627,79 +556,6 @@ void AlarmNotifier::notify(const std::string& obj_type,
       last_fired_[automation.id] = ts_ms;
     }
   }
-}
-
-// ---------------------------------------------------------------------------
-// Query unifi-core for the owner's user_id.  No cache.  Returns "" on
-// any failure (DB unreachable, no user_settings row, etc.).
-// ---------------------------------------------------------------------------
-static std::string query_user_id_from_unifi_core() {
-  PGconn* conn = PQconnectdb(
-      "host=/run/postgresql port=5432 dbname=unifi-core user=postgres");
-  if (PQstatus(conn) != CONNECTION_OK) {
-    LOG(ERROR) << "[alarm] cannot query unifi-core DB: "
-               << PQerrorMessage(conn);
-    PQfinish(conn);
-    return {};
-  }
-  PGresult* res = PQexec(conn,
-      "SELECT user_id FROM user_settings LIMIT 1");
-  std::string user_id;
-  if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
-    user_id = PQgetvalue(res, 0, 0);
-    while (!user_id.empty() && user_id.back() == ' ') user_id.pop_back();
-  }
-  PQclear(res);
-  PQfinish(conn);
-  return user_id;
-}
-
-// ---------------------------------------------------------------------------
-// discover_protect_user_id()
-//
-// Reads the cached user ID from `cache_path`.  If missing, queries the
-// unifi-core PostgreSQL database on port 5432 for the first row of
-// `user_settings.user_id` and writes it back to `cache_path`.  The parent
-// directory of `cache_path` is created (mkdir 0755) as needed.
-// ---------------------------------------------------------------------------
-std::string discover_protect_user_id(const std::string& cache_path) {
-  // 1. Try reading cached value.
-  {
-    std::ifstream f(cache_path);
-    std::string line;
-    if (f.is_open() && std::getline(f, line) && line.size() >= 32) {
-      while (!line.empty() && (line.back() == '\n' || line.back() == '\r' ||
-                               line.back() == ' '))
-        line.pop_back();
-      if (!line.empty()) {
-        LOG(INFO) << "[alarm] loaded user ID from " << cache_path;
-        return line;
-      }
-    }
-  }
-
-  // 2. Query unifi-core DB (port 5432) for the owner's user ID.
-  std::string user_id = query_user_id_from_unifi_core();
-  if (user_id.empty()) {
-    LOG(ERROR) << "[alarm] no user_id found in unifi-core user_settings";
-    return {};
-  }
-
-  // 3. Cache to disk for future runs.
-  {
-    const size_t slash = cache_path.find_last_of('/');
-    if (slash != std::string::npos && slash > 0) {
-      (void)mkdir(cache_path.substr(0, slash).c_str(), 0755);
-    }
-    std::ofstream f(cache_path);
-    if (f.is_open()) {
-      f << user_id << '\n';
-      LOG(INFO) << "[alarm] saved user ID to " << cache_path;
-    } else {
-      LOG(ERROR) << "[alarm] could not write " << cache_path;
-    }
-  }
-  return user_id;
 }
 
 }  // namespace onvif

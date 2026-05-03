@@ -62,6 +62,7 @@ std::string build_sdt_payload(uint64_t start_ms,
 }  // namespace motion_poller_internal
 
 class AlarmNotifier;
+class ProtectUserIdProvider;
 
 /// Polls the UniFi Protect `events` table for `motion` events from first-party
 /// cameras that lack native smart detection, runs NanoDet-M on the existing
@@ -111,9 +112,14 @@ class MotionPoller {
   /// Local Protect API base URL (e.g. "http://localhost:7080").  Used to
   /// fetch MSR-format thumbnails (length != 24) that are stored as
   /// native UBV files served by the msp media server, rather than
-  /// rows in the thumbnails Postgres table.  Empty disables the
-  /// fallback (DB-only lookup).
-  void set_protect_api(const std::string& url, const std::string& user_id);
+  /// rows in the thumbnails Postgres table.  Empty url, or a null
+  /// provider, disables the fallback (DB-only lookup).
+  ///
+  /// On observed 401 from Protect API, the provider is asked to
+  /// refresh the user_id (rate-limited) and the request is retried
+  /// once with the new value.
+  void set_protect_api(const std::string& url,
+                       ProtectUserIdProvider* user_id_provider);
 
   /// Launch the background poll thread.  Non-blocking.
   void start();
