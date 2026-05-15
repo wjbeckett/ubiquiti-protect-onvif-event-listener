@@ -1242,34 +1242,6 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     std::string thumb_id;
     std::string sdt_json   = smart_detect_types_json(det->type);
     std::string obj_type   = sdo_type(det->type);
-    // Mirrors the attributes shape native first-party smartDetectZone
-    // events write; consumers (Find Anything filter, iOS app) skip our
-    // events when the shape is sparse.  confidence remains 0 here
-    // because detection_recorder does not yet propagate a real
-    // detection score from the ONVIF event path -- separate fix.
-    const std::string attributes =
-        std::string("{")
-        + "\"associatedFaceTrackerID\":null,"
-        + "\"blurness\":null,"
-        + "\"color\":null,"
-        + "\"confidence\":0,"
-        + "\"faceEmbed\":null,"
-        + "\"faceLandmarks\":null,"
-        + "\"faceMask\":null,"
-        + "\"facePose\":null,"
-        + "\"faceVerifyStatus\":null,"
-        + "\"line\":null,"
-        + "\"matchedId\":null,"
-        + "\"matchedName\":null,"
-        + "\"namesTopK\":null,"
-        + "\"objectType\":\"" + obj_type + "\","
-        + "\"personEmbedFromCamera\":null,"
-        + "\"qualityScore\":null,"
-        + "\"topKCandidate\":null,"
-        + "\"trackerId\":1,"
-        + "\"vehicleType\":null,"
-        + "\"zone\":[]"
-        + "}";
 
     // 3. Fetch snapshot if the backend needs it.
     std::vector<unsigned char> snapshot;
@@ -1401,6 +1373,33 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     if (thumb_id.empty()) {
       thumb_id = db_->make_thumbnail_id(ev.camera_ip, ts_ms);
     }
+
+    // Build attributes here, after the NanoDet override above may have
+    // mutated obj_type -- Protect's Find-Anything filter joins on
+    // attributes->>'objectType', so it must match the outer SDO type column.
+    const std::string attributes =
+        std::string("{")
+        + "\"associatedFaceTrackerID\":null,"
+        + "\"blurness\":null,"
+        + "\"color\":null,"
+        + "\"confidence\":0,"
+        + "\"faceEmbed\":null,"
+        + "\"faceLandmarks\":null,"
+        + "\"faceMask\":null,"
+        + "\"facePose\":null,"
+        + "\"faceVerifyStatus\":null,"
+        + "\"line\":null,"
+        + "\"matchedId\":null,"
+        + "\"matchedName\":null,"
+        + "\"namesTopK\":null,"
+        + "\"objectType\":\"" + obj_type + "\","
+        + "\"personEmbedFromCamera\":null,"
+        + "\"qualityScore\":null,"
+        + "\"topKCandidate\":null,"
+        + "\"trackerId\":1,"
+        + "\"vehicleType\":null,"
+        + "\"zone\":[]"
+        + "}";
 
     // 4. INSERT into both tables, write thumbnail -- all under lock.
     {

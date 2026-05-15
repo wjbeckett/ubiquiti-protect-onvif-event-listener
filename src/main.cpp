@@ -65,10 +65,12 @@
 #ifndef ONVIF_RECORDER_VERSION
 #define ONVIF_RECORDER_VERSION "dev"
 #endif
+#include "cameras_change_listener.hpp"
 #include "motion_poller.hpp"
 #include "object_detect.hpp"
 #include "onvif_listener.hpp"
 #include "patch_watcher.hpp"
+#include "protect_pid_watcher.hpp"
 #include "protect_ui_patch.hpp"
 #include "protect_user_id_provider.hpp"
 #include "runtime_config.hpp"
@@ -800,6 +802,12 @@ int main(int argc, char* argv[]) {
   //     above, which now carry hasSmartDetect=true but still need our
   //     software to classify their events.
   // ----------------------------------------------------------------
+  // First-party camera IDs the recorder is responsible for keeping pinned
+  // in Protect's featureFlags (i.e. that need enable_smart_detect to take
+  // effect and stay in effect).  Populated below alongside the motion
+  // poller watch list; read after the block by the CamerasChangeListener.
+  std::set<std::string> first_party_managed_ids;
+
   std::unique_ptr<onvif::MotionPoller> motion_poller;
   {
     std::vector<std::string> fp_ids;
@@ -811,6 +819,7 @@ int main(int argc, char* argv[]) {
                           const std::string& mac) {
       if (id.empty() || !seen.insert(id).second) return;
       fp_ids.push_back(id);
+      first_party_managed_ids.insert(id);
       if (!mac.empty()) fp_macs[id] = mac;
       LOG(INFO) << "[motion_poller]   " << id << " (" << name << ")";
     };
@@ -961,6 +970,40 @@ int main(int argc, char* argv[]) {
     g_poller = motion_poller.get();
     motion_poller->start();
   }
+
+  // CamerasChangeListener: re-flips featureFlags when Protect's controller
+  // clobbers our enable_smart_detect writes (typically on adoption,
+  // reconnect, and a few minutes into Protect's own start-up).  Pairs with
+  // ProtectPidWatcher below, which handles the larger "Protect restarted"
+  // case via a self-restart 300 s after Protect stabilises.
+  //
+  // The managed set is the union of explicit --first_party_cameras IDs
+  // and auto-discovered non-smart-detect first-party cameras -- both of
+  // which the recorder runs enable_smart_detect on at start-up and needs
+  // to keep pinned.  Third-party cameras don't need this because Protect
+  // does not re-sync their featureFlags from device capabilities.
+  std::unique_ptr<onvif::CamerasChangeListener> cameras_change_listener;
+  if (!first_party_managed_ids.empty()) {
+    cameras_change_listener = std::make_unique<onvif::CamerasChangeListener>(
+        cam_db, first_party_managed_ids, cam_log);
+    auto s = cameras_change_listener->start();
+    if (!s.ok()) {
+      LOG(WARNING) << "[cameras_listener] start failed: " << s.message()
+                   << " (continuing without reactive featureFlags pin)";
+      cameras_change_listener.reset();
+    }
+  }
+
+  // ProtectPidWatcher: when unifi-protect's MainPID changes (firmware
+  // upgrade, manual restart, crash), wait until the new PID has been
+  // alive for 300 s and then SIGTERM ourselves so systemd restarts us
+  // cleanly.  The fresh start-up re-runs enable_smart_detect *after*
+  // Protect has finished its initial re-sync, so the flip sticks.
+  // The 300 s settle window prevents us from crash-looping in step with
+  // Protect when Protect itself is crash-looping.
+  onvif::ProtectPidWatcher protect_pid_watcher;
+  if (!protect_pid_watcher.start())
+    LOG(WARNING) << "[protect_watcher] failed to start";
 
   // Background rescan thread: periodically re-query Protect's cameras
   // table and hot-add any cameras that appear after startup.  Lets users

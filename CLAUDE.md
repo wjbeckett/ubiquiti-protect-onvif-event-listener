@@ -464,6 +464,73 @@ the package cleans up after itself:
 `/var/lib/onvif-recorder`, the systemd timer drop-ins, and the
 apt source.
 
+### Firmware survivability (persistent recovery layer)
+
+UDM firmware upgrades replace the squashfs lower layer of the
+overlayfs root, which wipes everything under `/usr/`, `/lib/`, and
+parts of `/etc/` (notably `/etc/apt/sources.list.d/`). They preserve
+`/data/`, `/etc/cron.d/`, and `/etc/systemd/system/`. Without a
+recovery layer the package vanishes after every firmware upgrade and
+the user has to re-run the installer manually — this is the root
+cause of issue #30.
+
+To make survival automatic, **`gh-pages/install.sh` deploys a small
+recovery layer outside the .deb** (so it survives both firmware
+upgrades and `apt purge`):
+
+| Path | Role |
+|------|------|
+| `/data/onvif-recorder/install.sh` | Self-copy of the published installer (so boot-restore doesn't need network access to gh-pages just to find the script). |
+| `/data/onvif-recorder/boot-restore.sh` | Wakes on boot via cron; if the .deb is missing, restores config from `backups/` and runs `install.sh`. |
+| `/data/onvif-recorder/backup.sh` | Tars `/etc/onvif-recorder`, `/etc/default/onvif-recorder*`, and `/var/lib/onvif-recorder` to `backups/config-current.tar.gz`. |
+| `/data/onvif-recorder/backups/config-current.tar.gz` | Latest config snapshot. Used by `boot-restore.sh` and re-built daily. |
+| `/data/onvif-recorder/backups/config-YYYY-MM-DD.tar.gz` | Weekly snapshots (Sundays), trimmed to last 4. |
+| `/data/onvif-recorder/.autoupdate-consent` | `true` or `false`. Controls whether `boot-restore.sh` actually re-installs. Regenerated from `config.json`'s `autoupdate_enabled` on every install. |
+| `/etc/cron.d/onvif-recorder-boot-restore` | `@reboot root /data/onvif-recorder/boot-restore.sh` |
+| `/etc/cron.d/onvif-recorder-backup` | Daily backup at 04:17 → `/data/onvif-recorder/backup.sh` |
+| `/var/log/onvif-recorder-boot-restore.log` | Log of restore attempts (one block per boot). |
+
+**Why outside the .deb?** Because `apt purge` removes everything dpkg
+knows about. If the recovery scripts lived inside the package, purging
+would wipe them along with the application, defeating the whole
+point. Keeping them on `/data` and in `/etc/cron.d/` (neither managed
+by dpkg) means a normal `apt remove` and `apt purge` leave the
+recovery layer untouched, ready to re-install on next boot.
+
+**Why gated on consent?** A user who explicitly purges the package
+probably doesn't want a boot cron silently reinstalling it. The
+`.autoupdate-consent` flag defaults to whatever `config.json` says
+about `autoupdate_enabled`; it can also be flipped manually:
+
+```bash
+ssh root@<router> 'echo true  > /data/onvif-recorder/.autoupdate-consent'   # enable
+ssh root@<router> 'echo false > /data/onvif-recorder/.autoupdate-consent'   # disable
+```
+
+### Uninstall — full purge
+
+For a *complete* removal, including the recovery layer:
+
+```bash
+# 1. Remove the package (runs --rollback=all via prerm, then wipes
+#    /etc/onvif-recorder, /var/lib/onvif-recorder, etc.):
+apt-get purge -y onvif-recorder
+
+# 2. Remove the persistent recovery layer (NOT managed by dpkg, so
+#    apt purge does not touch these — must be removed by hand):
+rm -rf /data/onvif-recorder
+rm -f  /etc/cron.d/onvif-recorder-boot-restore
+rm -f  /etc/cron.d/onvif-recorder-backup
+rm -f  /var/log/onvif-recorder-boot-restore.log
+rm -f  /var/log/onvif-recorder-backup.log
+```
+
+Skipping step 2 is intentional when the user only wants to clear apt
+state but plans to reinstall — the next boot (or `apt install`) will
+pick up the previous channel and config from the backup tarball. Only
+do step 2 when the user really wants the device to forget the
+application existed.
+
 ### APT suite promotion
 
 Releases land in `early-access` first. Promote manually via the `promote.yml`

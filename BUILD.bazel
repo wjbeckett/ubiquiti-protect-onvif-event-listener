@@ -353,6 +353,31 @@ cc_library(
 )
 
 cc_library(
+    name = "protect_pid_watcher",
+    srcs = ["src/protect_pid_watcher.cpp"],
+    hdrs = ["src/protect_pid_watcher.hpp"],
+    strip_include_prefix = "src",
+    deps = [
+        "@com_google_absl//absl/log:log",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "cameras_change_listener",
+    srcs = ["src/cameras_change_listener.cpp"],
+    hdrs = ["src/cameras_change_listener.hpp"],
+    strip_include_prefix = "src",
+    deps = _PQ + [
+        ":camera_change_log",
+        ":unifi_camera_config",
+        "@com_google_absl//absl/log:log",
+        "@com_google_absl//absl/status:status",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
     name = "protect_user_id_provider",
     srcs = ["src/protect_user_id_provider.cpp"],
     hdrs = ["src/protect_user_id_provider.hpp"],
@@ -401,6 +426,7 @@ cc_binary(
         ":admin_server",
         ":alarm_notifier",
         ":camera_change_log",
+        ":cameras_change_listener",
         ":contention_profiler",
         ":cpu_profiler",
         ":detection_recorder",
@@ -413,6 +439,7 @@ cc_binary(
         ":object_detect",
         ":onvif_listener",
         ":patch_watcher",
+        ":protect_pid_watcher",
         ":protect_ui_patch",
         ":protect_user_id_provider",
         ":runtime_config",
