@@ -71,7 +71,7 @@ std::optional<Detection> classify(const OnvifEvent& ev,
     std::string type;
     if      (rule_it->second == "Human")   type = "human";
     else if (rule_it->second == "Vehicle") type = "vehicle";
-    else return {};
+    else type = fallback_type;  // Hikvision sends rule name in Rule field (e.g. "MyFieldDetector1"); the cam's AcuSense classifier already filtered to human/vehicle implicitly, so fall back to default_object_type and let NanoDet-M refine the class on the snapshot.
 
     return Detection{type, inside_it->second == "true", ev.event_time};
   }
