@@ -102,8 +102,11 @@ std::string build_sdo_attributes(const std::string& obj_type, int confidence) {
   // Mirrors the attributes column shape that native first-party
   // smartDetectZone events write.  Nulls are sentinels Protect's UI /
   // iOS app expect to be present (not absent).  trackerId=1 because we
-  // only emit one detection per event; zone=[] because we do not
-  // currently propagate zone IDs.
+  // only emit one detection per event.  zone defaults to [1]: the iOS
+  // app dereferences attributes.zone[0] without checking length, so an
+  // empty array crashes it.  Native events always carry at least the
+  // default zone id [1]; we match that here until we propagate real
+  // smartDetectZones intersections.
   return std::string("{")
       + "\"associatedFaceTrackerID\":null,"
       + "\"blurness\":null,"
@@ -124,7 +127,7 @@ std::string build_sdo_attributes(const std::string& obj_type, int confidence) {
       + "\"topKCandidate\":null,"
       + "\"trackerId\":1,"
       + "\"vehicleType\":null,"
-      + "\"zone\":[]"
+      + "\"zone\":[1]"
       + "}";
 }
 

@@ -1468,12 +1468,19 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
     // Build attributes here, after the NanoDet override above may have
     // mutated obj_type -- Protect's Find-Anything filter joins on
     // attributes->>'objectType', so it must match the outer SDO type column.
+    //
+    // confidence + zone must mirror what Protect's native AI writes for a
+    // smart-detect row: a non-zero confidence (we use 100 to match the
+    // events.score literal we set below) and a non-empty zone array.  The
+    // iOS app dereferences attributes.zone[0] without a length check, so
+    // writing zone:[] crashes the mobile app on every recent event for
+    // third-party cameras.
     const std::string attributes =
         std::string("{")
         + "\"associatedFaceTrackerID\":null,"
         + "\"blurness\":null,"
         + "\"color\":null,"
-        + "\"confidence\":0,"
+        + "\"confidence\":100,"
         + "\"faceEmbed\":null,"
         + "\"faceLandmarks\":null,"
         + "\"faceMask\":null,"
@@ -1489,7 +1496,7 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
         + "\"topKCandidate\":null,"
         + "\"trackerId\":1,"
         + "\"vehicleType\":null,"
-        + "\"zone\":[]"
+        + "\"zone\":[1]"
         + "}";
 
     // Version gate: on Protect 7.1+, write the rich events.metadata + the

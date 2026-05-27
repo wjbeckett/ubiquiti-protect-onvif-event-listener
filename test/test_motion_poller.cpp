@@ -145,8 +145,10 @@ static void test_build_sdo_attributes_fields() {
         "build_sdo_attributes: trackerId=1");
   check(contains(j, "\"vehicleType\":null"),
         "build_sdo_attributes: vehicleType null");
-  check(contains(j, "\"zone\":[]"),
-        "build_sdo_attributes: zone empty array");
+  // zone MUST be a non-empty array: iOS reads attributes.zone[0]
+  // unchecked and crashes on []. Default to [1] to match native events.
+  check(contains(j, "\"zone\":[1]"),
+        "build_sdo_attributes: zone defaults to [1] (iOS crash guard)");
 
   check(!j.empty() && j.front() == '{' && j.back() == '}',
         "build_sdo_attributes: outer braces present");
