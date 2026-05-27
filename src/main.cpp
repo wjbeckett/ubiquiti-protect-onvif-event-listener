@@ -237,6 +237,22 @@ ABSL_FLAG(std::string, first_party_fallback_class, "person",
     "'animal' / 'package' or any string Protect's UI recognises.  Default "
     "'person' (the most common case for a typical home camera).");
 
+ABSL_FLAG(int32_t, motion_video_sample_secs, 5,
+    "When > 0, motion_poller pulls multiple snapshot frames per first-party "
+    "motion event by calling /api/cameras/<id>/snapshot?ts=<ms> at 1-second "
+    "offsets starting at the real motion-start time, for N seconds where "
+    "N = min(this flag, event length in seconds).  A single baseline frame "
+    "is fetched at (start - 5s) and any class already present in that frame "
+    "is suppressed from the event sample (so a constantly-parked car does "
+    "not trigger on its own appearance).  Set to 0 to disable time-travel "
+    "sampling and use only Protect's stored cropped thumbnail (legacy "
+    "behaviour).  Default 5.");
+ABSL_FLAG(std::string, camera_video_sample_secs, "",
+    "Per-camera overrides for --motion_video_sample_secs as comma-separated "
+    "<camera_id>=<secs> pairs, e.g. "
+    "'699bf42400214a03e4000459=7,abcd...=3'.  Camera IDs are the 24-char hex "
+    "ids from the cameras table (same as --first_party_cameras).  When "
+    "present, overrides the global cap for that camera.");
 ABSL_FLAG(int32_t, motion_backfill_days, 7,
     "On startup, motion_poller pulls its per-camera high-water mark back "
     "to (now - N days) so the live poll loop re-scans recent motion events "
@@ -943,6 +959,16 @@ int main(int argc, char* argv[]) {
         motion_poller->set_always_smart_detect(
             absl::GetFlag(FLAGS_first_party_always_smart_detect),
             absl::GetFlag(FLAGS_first_party_fallback_class));
+        // Time-travel sampling: global cap + per-camera overrides (camera-id
+        // keyed, parallel to the IP-keyed detection_recorder flags above).
+        std::map<std::string, int> per_cam_video_secs;
+        for_each_ip_value(absl::GetFlag(FLAGS_camera_video_sample_secs),
+            [&](const std::string& id, const std::string& v) {
+              per_cam_video_secs[id] = std::atoi(v.c_str());
+            });
+        motion_poller->set_video_sample_secs(
+            absl::GetFlag(FLAGS_motion_video_sample_secs),
+            per_cam_video_secs);
       } else {
         LOG(ERROR) << "[motion_poller] " << mp_or.status().message();
       }

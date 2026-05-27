@@ -138,6 +138,16 @@ class ObjectDetector {
   std::optional<Detection> detect(
       const std::vector<uint8_t>& jpeg_bytes) const;
 
+  /// Same as detect() but returns every security-relevant detection (post-NMS)
+  /// rather than just the highest-confidence one.  Used by motion_poller's
+  /// pre-event baseline pass to enumerate all classes present in a "before"
+  /// frame (e.g. a parked car + a person already in the scene) so subsequent
+  /// detections of those same classes can be suppressed as not-new.
+  /// Returns an empty vector if NCNN is not compiled in, the JPEG is invalid,
+  /// or no detection clears the confidence threshold.
+  std::vector<Detection> detect_all(
+      const std::vector<uint8_t>& jpeg_bytes) const;
+
  private:
   ObjectDetector() = default;
 

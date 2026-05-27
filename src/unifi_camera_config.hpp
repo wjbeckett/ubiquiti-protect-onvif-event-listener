@@ -57,6 +57,22 @@ std::string json_get(const std::string& json, const std::string& key);
 /// Exposed for testing.
 std::string pg_array(const std::vector<std::string>& ids);
 
+/// Some camera models advertise a snapshotUrl via ONVIF that isn't actually
+/// the working snapshot endpoint -- the classic case is Dahua (and Dahua
+/// OEM rebrands like Amcrest), which advertises /onvif/snapshot?... but
+/// only serves JPEGs from /cgi-bin/snapshot.cgi.  When @p camera_type
+/// matches a known-broken vendor AND @p original_url's path is the
+/// /onvif/snapshot one, this returns a rewritten URL with the path
+/// replaced.  Otherwise @p original_url is returned unchanged.
+///
+/// Operators can override the per-camera snapshot URL via the
+/// --camera_snapshot_urls flag; that override applies AFTER load_cameras
+/// so it still wins over this auto-fix.
+///
+/// Exposed for testing.
+std::string maybe_rewrite_dahua_snapshot_url(const std::string& camera_type,
+                                              const std::string& original_url);
+
 }  // namespace internal
 
 /// Connect to the UniFi Protect database and return a CameraConfig for every

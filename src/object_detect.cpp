@@ -244,13 +244,13 @@ ObjectDetector::~ObjectDetector() = default;
 // detect
 // ---------------------------------------------------------------------------
 
-std::optional<Detection> ObjectDetector::detect(
+std::vector<Detection> ObjectDetector::detect_all(
     const std::vector<uint8_t>& jpeg_bytes) const {
 #ifndef WITH_NCNN
   (void)jpeg_bytes;
-  return std::nullopt;
+  return {};
 #else
-  if (!impl_ || jpeg_bytes.empty()) return std::nullopt;
+  if (!impl_ || jpeg_bytes.empty()) return {};
 
   // ---- Decode JPEG to RGB pixels -----------------------------------------
   jpeg_decompress_struct srcinfo{};
@@ -268,14 +268,14 @@ std::optional<Detection> ObjectDetector::detect(
   jpeg_read_header(&srcinfo, TRUE);
   if (srcerr.fatal) {
     jpeg_destroy_decompress(&srcinfo);
-    return std::nullopt;
+    return {};
   }
 
   srcinfo.out_color_space = JCS_RGB;
   jpeg_start_decompress(&srcinfo);
   if (srcerr.fatal) {
     jpeg_destroy_decompress(&srcinfo);
-    return std::nullopt;
+    return {};
   }
 
   const int orig_w    = static_cast<int>(srcinfo.output_width);
@@ -295,7 +295,7 @@ std::optional<Detection> ObjectDetector::detect(
   }
   jpeg_finish_decompress(&srcinfo);
   jpeg_destroy_decompress(&srcinfo);
-  if (srcerr.fatal || orig_w == 0 || orig_h == 0) return std::nullopt;
+  if (srcerr.fatal || orig_w == 0 || orig_h == 0) return {};
 
   // ---- Compute letterbox padding -----------------------------------------
   const int target_w = impl_->input_w;
@@ -355,36 +355,51 @@ std::optional<Detection> ObjectDetector::detect(
 
   nms_inplace(dets, kNmsThreshold);
 
-  // ---- Filter to security-relevant classes --------------------------------
-  Det* best = nullptr;
-  for (auto& d : dets) {
-    if (!is_security_relevant(d.cls)) continue;
-    if (!best || d.conf > best->conf) best = &d;
-  }
-  if (!best) return std::nullopt;
-
-  // ---- Scale box back to original image coords and normalise to [0,1] -----
+  // ---- Filter to security-relevant classes + scale each bbox --------------
+  // Caller (detect()) collapses this to the single best detection; the
+  // pre-event baseline path in motion_poller wants the full set so it can
+  // suppress any class already present in the scene.
   const float off_x = static_cast<float>(wpad / 2);
   const float off_y = static_cast<float>(hpad / 2);
 
-  const float x_orig = (best->x - off_x) / scale;
-  const float y_orig = (best->y - off_y) / scale;
-  const float w_orig = best->w / scale;
-  const float h_orig = best->h / scale;
+  std::vector<Detection> out;
+  out.reserve(dets.size());
+  for (const auto& d : dets) {
+    if (!is_security_relevant(d.cls)) continue;
 
-  jpeg_crop::BoundingBox bb;
-  bb.x = std::max(0.0f, std::min(1.0f, x_orig / static_cast<float>(orig_w)));
-  bb.y = std::max(0.0f, std::min(1.0f, y_orig / static_cast<float>(orig_h)));
-  bb.w = std::max(0.0f,
-                  std::min(1.0f - bb.x,
-                           w_orig / static_cast<float>(orig_w)));
-  bb.h = std::max(0.0f,
-                  std::min(1.0f - bb.y,
-                           h_orig / static_cast<float>(orig_h)));
+    const float x_orig = (d.x - off_x) / scale;
+    const float y_orig = (d.y - off_y) / scale;
+    const float w_orig = d.w / scale;
+    const float h_orig = d.h / scale;
 
-  if (bb.w <= 0.0f || bb.h <= 0.0f) return std::nullopt;
-  return Detection{bb, best->cls, best->conf};
+    jpeg_crop::BoundingBox bb;
+    bb.x = std::max(0.0f, std::min(1.0f, x_orig / static_cast<float>(orig_w)));
+    bb.y = std::max(0.0f, std::min(1.0f, y_orig / static_cast<float>(orig_h)));
+    bb.w = std::max(0.0f,
+                    std::min(1.0f - bb.x,
+                             w_orig / static_cast<float>(orig_w)));
+    bb.h = std::max(0.0f,
+                    std::min(1.0f - bb.y,
+                             h_orig / static_cast<float>(orig_h)));
+    if (bb.w <= 0.0f || bb.h <= 0.0f) continue;
+    out.push_back(Detection{bb, d.cls, d.conf});
+  }
+  // Highest confidence first so callers iterating in order naturally hit
+  // the "best" candidate, and detect() can return out[0] without sorting
+  // separately.
+  std::sort(out.begin(), out.end(),
+            [](const Detection& a, const Detection& b) {
+              return a.confidence > b.confidence;
+            });
+  return out;
 #endif  // WITH_NCNN
+}
+
+std::optional<Detection> ObjectDetector::detect(
+    const std::vector<uint8_t>& jpeg_bytes) const {
+  const std::vector<Detection> all = detect_all(jpeg_bytes);
+  if (all.empty()) return std::nullopt;
+  return all.front();  // sorted by confidence desc in detect_all().
 }
 
 // ---------------------------------------------------------------------------

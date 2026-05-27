@@ -39,6 +39,7 @@
 #include "absl/synchronization/mutex.h"
 #include "contention_profiler.hpp"
 #include "event_enricher.hpp"
+#include "pg_util.hpp"
 #include "protect_version.hpp"
 #include "util.hpp"
 #include "alarm_notifier.hpp"
@@ -284,7 +285,7 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
   // Verify the expected tables are accessible.  The schema already exists
   // in UniFi Protect's database -- we never try to create it.
   absl::Status create_schema() override {
-    PGresult* res = PQexec(conn_,
+    PGresult* res = onvif::pg::ExecWithTimeout(conn_, -1,
       "SELECT 1 FROM events LIMIT 0;"
       "SELECT 1 FROM \"smartDetectObjects\" LIMIT 0;"
       "SELECT 1 FROM \"smartDetectRaws\" LIMIT 0;"
@@ -353,7 +354,7 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
   // Returns -1 on error so callers can detect failure.
   int exec_purge(const char* sql, const char* label) {
     maybe_reconnect();
-    PGresult* res = PQexec(conn_, sql);
+    PGresult* res = onvif::pg::ExecWithTimeout(conn_, -1, sql);
     int deleted = 0;
     if (PQresultStatus(res) == PGRES_COMMAND_OK) {
       const char* tag = PQcmdTuples(res);
@@ -369,21 +370,21 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
 
   // Transaction helpers.
   bool begin_txn() {
-    PGresult* r = PQexec(conn_, "BEGIN");
+    PGresult* r = onvif::pg::ExecWithTimeout(conn_, -1, "BEGIN");
     bool ok = PQresultStatus(r) == PGRES_COMMAND_OK;
     if (!ok) LOG(ERROR) << "[pg] BEGIN failed: " << pg_errmsg(r);
     PQclear(r);
     return ok;
   }
   bool commit_txn() {
-    PGresult* r = PQexec(conn_, "COMMIT");
+    PGresult* r = onvif::pg::ExecWithTimeout(conn_, -1, "COMMIT");
     bool ok = PQresultStatus(r) == PGRES_COMMAND_OK;
     if (!ok) LOG(ERROR) << "[pg] COMMIT failed: " << pg_errmsg(r);
     PQclear(r);
     return ok;
   }
   void rollback_txn() {
-    PGresult* r = PQexec(conn_, "ROLLBACK");
+    PGresult* r = onvif::pg::ExecWithTimeout(conn_, -1, "ROLLBACK");
     if (PQresultStatus(r) != PGRES_COMMAND_OK)
       LOG(ERROR) << "[pg] ROLLBACK failed: " << pg_errmsg(r);
     PQclear(r);
@@ -396,7 +397,7 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
                    const int*         lengths = nullptr,
                    const int*         formats = nullptr) {
     maybe_reconnect();
-    PGresult* res = PQexecParams(conn_, sql, nparams, nullptr,
+    PGresult* res = onvif::pg::ExecParamsWithTimeout(conn_, -1, sql, nparams, nullptr,
                                  params, lengths, formats, 0);
     ExecStatusType st = PQresultStatus(res);
     if (st != PGRES_COMMAND_OK && st != PGRES_TUPLES_OK)
@@ -651,7 +652,7 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
     const char* params[] = {
       label_id.c_str(), name.c_str(), now_str.c_str()
     };
-    PGresult* res = PQexecParams(conn_,
+    PGresult* res = onvif::pg::ExecParamsWithTimeout(conn_, -1,
       "INSERT INTO labels (id, name, \"createdAt\", \"updatedAt\")"
       " VALUES ($1, $2, $3, $3)"
       " ON CONFLICT (name) DO UPDATE SET \"updatedAt\" = EXCLUDED.\"updatedAt\""
@@ -711,7 +712,7 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
         util::now_ms() - static_cast<uint64_t>(days) * 86400000ULL;
     const std::string since_str = std::to_string(since_ms);
     const char* params[] = { since_str.c_str() };
-    PGresult* res = PQexecParams(conn_,
+    PGresult* res = onvif::pg::ExecParamsWithTimeout(conn_, -1,
       "SELECT e.id, e.\"cameraId\", e.\"smartDetectTypes\"::text, e.start, e.\"end\""
       " FROM events e"
       " JOIN cameras c ON c.id = e.\"cameraId\""
@@ -888,8 +889,8 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
     // Helper: run a parameterized DELETE inside the transaction.
     // Returns false on error (caller should rollback).
     auto exec_step = [&](const char* sql, const char* label) -> bool {
-      PGresult* r = PQexecParams(
-          conn_, sql, 1, nullptr, p, nullptr, nullptr, 0);
+      PGresult* r = onvif::pg::ExecParamsWithTimeout(
+          conn_, -1, sql, 1, nullptr, p, nullptr, nullptr, 0);
       if (PQresultStatus(r) != PGRES_COMMAND_OK) {
         LOG(ERROR) << "[pg] purge_stale_open_events (" << label
                    << "): " << pg_errmsg(r);
@@ -952,7 +953,7 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
         "labels")) { rollback_txn(); return 0; }
 
     // Delete the stale event rows and return count.
-    PGresult* r = PQexecParams(conn_,
+    PGresult* r = onvif::pg::ExecParamsWithTimeout(conn_, -1,
         "DELETE FROM events e"
         " USING cameras c"
         " WHERE c.id = e.\"cameraId\""
@@ -1008,7 +1009,7 @@ struct PgBackend final : DetectionRecorder::IDbBackend {
     const int formats[7] = { 0, 0, 0, 0, 0, 0, 1 };  // $7 is binary
 
     maybe_reconnect();
-    PGresult* res = PQexecParams(conn_,
+    PGresult* res = onvif::pg::ExecParamsWithTimeout(conn_, -1,
       "INSERT INTO thumbnails"
       " (id, \"cameraId\", \"eventId\", timestamp, \"createdAt\","
       "  \"updatedAt\", content, \"isFullfov\")"

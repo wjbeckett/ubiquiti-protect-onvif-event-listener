@@ -23,6 +23,7 @@
 #include <utility>
 
 #include "absl/log/log.h"
+#include "pg_util.hpp"
 
 namespace onvif {
 
@@ -39,7 +40,7 @@ std::string query_user_id_from_unifi_core() {
     PQfinish(conn);
     return {};
   }
-  PGresult* res = PQexec(conn,
+  PGresult* res = onvif::pg::ExecWithTimeout(conn, -1,
       "SELECT user_id FROM user_settings LIMIT 1");
   std::string user_id;
   if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {

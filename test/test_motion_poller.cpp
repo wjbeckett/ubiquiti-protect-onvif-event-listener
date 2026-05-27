@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <iostream>
 #include <string>
+#include <vector>
 
 #include "motion_poller.hpp"
 #include "object_detect.hpp"
@@ -238,6 +239,92 @@ static void test_detection_type_coco_mapping() {
   check(!is_security_relevant(50), "is_security_relevant(50) excluded");
 }
 
+// ---------------------------------------------------------------
+// select_best_candidate_index (time-travel sampling + baseline)
+// ---------------------------------------------------------------
+
+using onvif::motion_poller_internal::Candidate;
+using onvif::motion_poller_internal::select_best_candidate_index;
+
+// No baseline + single candidate -> that candidate wins.
+static void test_select_no_baseline_single() {
+  std::vector<Candidate> evs = {{"person", 74}};
+  check(select_best_candidate_index({}, evs) == 0,
+        "select: no baseline + single person -> idx 0");
+}
+
+// Empty event list -> -1 (no winner).
+static void test_select_empty_events() {
+  check(select_best_candidate_index({}, {}) == -1,
+        "select: empty events -> -1");
+  check(select_best_candidate_index({"vehicle"}, {}) == -1,
+        "select: empty events with baseline -> -1");
+}
+
+// Highest confidence wins across multiple candidates.
+static void test_select_picks_highest_confidence() {
+  std::vector<Candidate> evs = {
+      {"person", 50},   // idx 0
+      {"person", 85},   // idx 1 — highest
+      {"person", 60},   // idx 2
+  };
+  check(select_best_candidate_index({}, evs) == 1,
+        "select: 50/85/60 -> idx 1 (highest)");
+}
+
+// Tie-break on equal confidence: earliest index wins.
+static void test_select_ties_break_to_earliest_index() {
+  std::vector<Candidate> evs = {
+      {"person", 70},   // idx 0
+      {"vehicle", 70},  // idx 1 — same conf
+  };
+  check(select_best_candidate_index({}, evs) == 0,
+        "select: equal conf -> earliest idx wins");
+}
+
+// THE PARKED-CAR CASE: vehicle in baseline AND in event -> suppressed.
+static void test_select_parked_car_suppressed() {
+  std::vector<Candidate> evs = {
+      {"vehicle", 80},  // parked car still there
+  };
+  check(select_best_candidate_index({"vehicle"}, evs) == -1,
+        "select: parked car suppressed (vehicle in baseline)");
+}
+
+// Mixed case: vehicle baseline, vehicle + person in event -> person wins.
+static void test_select_person_through_parked_car() {
+  std::vector<Candidate> evs = {
+      {"vehicle", 90},  // the parked car -> suppressed
+      {"person",  55},  // the actual person walking past
+  };
+  check(select_best_candidate_index({"vehicle"}, evs) == 1,
+        "select: person wins through parked car");
+}
+
+// All event classes in baseline -> -1 (the "always-there" no-op).
+static void test_select_all_classes_in_baseline() {
+  std::vector<Candidate> evs = {
+      {"vehicle", 80},
+      {"animal",  70},
+  };
+  check(select_best_candidate_index({"vehicle", "animal"}, evs) == -1,
+        "select: all classes in baseline -> no winner");
+}
+
+// Multi-frame realism: same person classified twice with different confidences
+// across frames -> the higher-conf frame wins.
+static void test_select_same_class_two_frames() {
+  std::vector<Candidate> evs = {
+      // frame 0: weak detection
+      {"person", 42},
+      // frame 1: nothing classified
+      // frame 2: strong detection -- person is mid-frame now
+      {"person", 78},
+  };
+  check(select_best_candidate_index({}, evs) == 1,
+        "select: stronger detection in later frame wins");
+}
+
 int main() {
   test_smart_detect_types_known();
   test_smart_detect_types_person_default();
@@ -248,6 +335,15 @@ int main() {
   test_build_sdt_payload_fields();
   test_build_sdt_payload_zero_duration();
   test_detection_type_coco_mapping();
+
+  test_select_no_baseline_single();
+  test_select_empty_events();
+  test_select_picks_highest_confidence();
+  test_select_ties_break_to_earliest_index();
+  test_select_parked_car_suppressed();
+  test_select_person_through_parked_car();
+  test_select_all_classes_in_baseline();
+  test_select_same_class_two_frames();
 
   std::cout << "test_motion_poller: "
             << g_pass << " passed, " << g_fail << " failed\n";

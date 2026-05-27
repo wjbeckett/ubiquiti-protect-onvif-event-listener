@@ -33,6 +33,7 @@
 #include "absl/log/log.h"
 #include "absl/status/status.h"
 #include "event_enricher.hpp"
+#include "pg_util.hpp"
 #include "protect_version.hpp"
 
 namespace onvif {
@@ -61,7 +62,7 @@ std::string FindPgRestore() {
 // Pull a single-column bigint result from a simple SELECT.  Returns -1 on
 // null/missing/error so callers can distinguish "no rows" from "value 0".
 int64_t SelectBigint(PGconn* conn, const char* sql) {
-  PGresult* r = PQexec(conn, sql);
+  PGresult* r = onvif::pg::ExecWithTimeout(conn, -1, sql);
   if (PQresultStatus(r) != PGRES_TUPLES_OK) {
     LOG(WARNING) << "[recovery] query failed: " << PQerrorMessage(conn);
     PQclear(r);
@@ -82,7 +83,7 @@ int64_t SelectBigint(PGconn* conn, const char* sql) {
 }
 
 bool RunSimple(PGconn* conn, const std::string& sql) {
-  PGresult* r = PQexec(conn, sql.c_str());
+  PGresult* r = onvif::pg::ExecWithTimeout(conn, -1, sql.c_str());
   bool ok = (PQresultStatus(r) == PGRES_COMMAND_OK
              || PQresultStatus(r) == PGRES_TUPLES_OK);
   if (!ok) LOG(WARNING) << "[recovery] " << PQerrorMessage(conn);
@@ -242,7 +243,7 @@ absl::Status EnrichRestored(PGconn* conn, int image_width, int image_height) {
       "    ) "
       "  )";
 
-  PGresult* r = PQexec(conn, select_events);
+  PGresult* r = onvif::pg::ExecWithTimeout(conn, -1, select_events);
   if (PQresultStatus(r) != PGRES_TUPLES_OK) {
     auto msg = std::string("[recovery] select events failed: ")
              + PQerrorMessage(conn);
@@ -276,8 +277,8 @@ absl::Status EnrichRestored(PGconn* conn, int image_width, int image_height) {
     // sources use the same UUID space so the FK chain SDA -> SDO -> event
     // stays coherent.
     const char* sdo_params[] = { ein.event_id.c_str() };
-    PGresult* s = PQexecParams(
-        conn,
+    PGresult* s = onvif::pg::ExecParamsWithTimeout(
+        conn, -1,
         "SELECT id FROM \"smartDetectObjects\" WHERE \"eventId\" = $1 "
         "UNION "
         "SELECT \"objectId\" FROM \"detectionLabels\" "
@@ -305,8 +306,8 @@ absl::Status EnrichRestored(PGconn* conn, int image_width, int image_height) {
         ein.thumbnail_id.empty() ? nullptr : ein.thumbnail_id.c_str(),
         det_type.c_str(), attrs.c_str(), ts_ms_str.c_str(),
       };
-      PGresult* sr = PQexecParams(
-          conn,
+      PGresult* sr = onvif::pg::ExecParamsWithTimeout(
+          conn, -1,
           "INSERT INTO \"smartDetectObjects\" "
           "(id, \"eventId\", \"cameraId\", \"thumbnailId\", type, attributes, "
           " \"detectedAt\", metadata, \"createdAt\", \"updatedAt\") "
@@ -337,8 +338,8 @@ absl::Status EnrichRestored(PGconn* conn, int image_width, int image_height) {
       ein.thumbnail_id.empty() ? nullptr : ein.thumbnail_id.c_str(),
       ein.event_id.c_str(),
     };
-    PGresult* upr = PQexecParams(
-        conn,
+    PGresult* upr = onvif::pg::ExecParamsWithTimeout(
+        conn, -1,
         "UPDATE events SET metadata = $1::json, "
         "                  \"thumbnailFullfovId\" = "
         "                      COALESCE(\"thumbnailFullfovId\", $2) "

@@ -74,6 +74,17 @@ cc_library(
 )
 
 cc_library(
+    name = "pg_util",
+    srcs = ["src/pg_util.cpp"],
+    hdrs = ["src/pg_util.hpp"],
+    strip_include_prefix = "src",
+    deps = [
+        "@com_google_absl//absl/log:log",
+    ] + _PQ,
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
     name = "event_enricher",
     srcs = ["src/event_enricher.cpp"],
     hdrs = ["src/event_enricher.hpp"],
@@ -89,6 +100,7 @@ cc_library(
     strip_include_prefix = "src",
     deps = [
         ":event_enricher",
+        ":pg_util",
         ":protect_version",
         "@com_google_absl//absl/log:log",
         "@com_google_absl//absl/status:status",
@@ -287,6 +299,7 @@ cc_library(
     strip_include_prefix = "src",
     deps = [
         ":msr_client",
+        ":pg_util",
         "@com_google_absl//absl/log:log",
     ] + _PQ,
     visibility = ["//visibility:public"],
@@ -299,6 +312,7 @@ cc_library(
     strip_include_prefix = "src",
     deps = [
         ":contention_profiler",
+        ":pg_util",
         ":protect_user_id_provider",
         ":util",
         "@com_google_absl//absl/log:log",
@@ -320,6 +334,7 @@ cc_library(
         ":msr_client",
         ":object_detect",
         ":onvif_listener",
+        ":pg_util",
         ":protect_version",
         ":ubv_thumbnail",
         ":util",
@@ -354,6 +369,7 @@ cc_library(
     deps = [
         ":camera_change_log",
         ":onvif_listener",
+        ":pg_util",
         "@com_google_absl//absl/log:log",
         "@com_google_absl//absl/status:status",
         "@com_google_absl//absl/status:statusor",
@@ -404,6 +420,7 @@ cc_library(
     strip_include_prefix = "src",
     deps = _PQ + [
         ":camera_change_log",
+        ":pg_util",
         ":unifi_camera_config",
         "@com_google_absl//absl/log:log",
         "@com_google_absl//absl/status:status",
@@ -417,6 +434,7 @@ cc_library(
     hdrs = ["src/protect_user_id_provider.hpp"],
     strip_include_prefix = "src",
     deps = _PQ + [
+        ":pg_util",
         "@com_google_absl//absl/log:log",
         "@com_google_absl//absl/synchronization:synchronization",
     ],
@@ -445,6 +463,7 @@ cc_library(
         ":jpeg_crop",
         ":msr_client",
         ":object_detect",
+        ":pg_util",
         ":protect_user_id_provider",
         ":protect_version",
         ":ubv_thumbnail",
@@ -477,6 +496,7 @@ cc_binary(
         ":object_detect",
         ":onvif_listener",
         ":patch_watcher",
+        ":pg_util",
         ":protect_pid_watcher",
         ":protect_ui_patch",
         ":protect_user_id_provider",
@@ -542,6 +562,7 @@ cc_binary(
     name = "ubv_extract",
     srcs = ["src/ubv_extract.cpp"],
     deps = [
+        ":pg_util",
         ":ubv_thumbnail",
         "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/flags:parse",
@@ -555,6 +576,7 @@ cc_binary(
     linkstatic = True,
     deps = [
         ":event_enricher",
+        ":pg_util",
         ":util",
         "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/flags:parse",

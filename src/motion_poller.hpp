@@ -59,6 +59,35 @@ std::string build_sdt_payload(uint64_t start_ms,
                                const std::string& obj_type,
                                int confidence);
 
+/// One per-frame detection candidate for the time-travel sampling pass.
+/// Carries only what `select_best_candidate_index` needs: the security
+/// class label and the model's confidence scaled to [0, 100].  The caller
+/// keeps a parallel array of (jpeg, bbox) so it can recover the original
+/// frame data for the chosen index.
+struct Candidate {
+  std::string obj_type;     // "person" / "vehicle" / "animal" / "package"
+  int         confidence_pct;
+};
+
+/// Pick the best detection from a time-travel sample window, ignoring any
+/// class that was already present in the pre-event baseline frame.
+///
+/// @p baseline_classes  obj_types found in the (start - 5000ms) baseline.
+///                       A parked car will be {"vehicle"}, an empty driveway
+///                       {}, etc.
+/// @p event_candidates  flattened list of detections from every event-window
+///                       frame (start+0, start+1s, ..., start+(N-1)s).
+///
+/// Returns the index of the highest-confidence candidate whose obj_type is
+/// NOT in @p baseline_classes, or -1 if every candidate's class also appears
+/// in the baseline (the "always-a-car" no-op case).
+///
+/// Tie-break: equal confidences -> lowest index (earliest frame).
+/// Exposed for testing.
+int select_best_candidate_index(
+    const std::vector<std::string>& baseline_classes,
+    const std::vector<Candidate>& event_candidates);
+
 }  // namespace motion_poller_internal
 
 class AlarmNotifier;
@@ -125,6 +154,30 @@ class MotionPoller {
   /// Coalescing window (seconds).  If a smart detection event already exists
   /// near a motion event, the motion event is skipped.  Default: 30.
   void set_coalesce_window(uint32_t sec);
+
+  /// Configure time-travel snapshot sampling for first-party motion events.
+  ///
+  /// When @p global_secs > 0, motion_poller fetches frames from Protect's
+  /// `/api/cameras/<id>/snapshot?ts=<ms>` endpoint at 1-second offsets
+  /// starting at the real motion-start moment, for N seconds where
+  ///   N = min(per_camera[id] when present otherwise global_secs,
+  ///           max(1, ceil((end - start)/1000))).
+  /// Each frame is run through NanoDet-M and the highest-confidence
+  /// security-relevant detection across all frames is used.
+  ///
+  /// A single baseline frame is also fetched at (start - 5000ms);
+  /// any class detected in that baseline is treated as "already in the
+  /// scene" (e.g. a parked car) and suppressed from the event sample.
+  /// If every event-frame detection's class also appears in the baseline,
+  /// the poller behaves as if NanoDet returned nothing (and falls through
+  /// to the always-smart-detect fallback when that is enabled).
+  ///
+  /// Set @p global_secs <= 0 (or leave unset) to disable the time-travel
+  /// path entirely; the poller then keeps using the legacy single-snapshot
+  /// + cropped-thumbnail flow.  Per-camera overrides are matched by camera
+  /// ID (24-char hex from the cameras table), not IP.
+  void set_video_sample_secs(int global_secs,
+                              const std::map<std::string, int>& per_camera);
 
   /// When enabled, thumbnail IDs use the MSR "{MAC}-{timestamp_ms}" format
   /// matching native Protect.  Must be called before start().

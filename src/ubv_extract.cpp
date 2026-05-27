@@ -47,6 +47,7 @@
 #include "absl/flags/flag.h"
 #include "absl/flags/parse.h"
 #include "absl/status/statusor.h"
+#include "pg_util.hpp"
 
 // ---------------------------------------------------------------------------
 // flags
@@ -144,8 +145,8 @@ int main(int argc, char** argv) {
       // Query: look for an event with this exact thumbnailId.
       // Fall back to closest event by start time if not found.
       const char* param = thumbnail_id.c_str();
-      PGresult* res = PQexecParams(
-        conn,
+      PGresult* res = onvif::pg::ExecParamsWithTimeout(
+        conn, -1,
         "SELECT type, "
         "  to_char(to_timestamp(start/1000.0) AT TIME ZONE 'UTC',"
         "           'YYYY-MM-DD_HH24-MI-SS') AS event_time "

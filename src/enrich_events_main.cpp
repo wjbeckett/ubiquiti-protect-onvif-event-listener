@@ -44,6 +44,7 @@
 #include "absl/strings/str_split.h"
 
 #include "event_enricher.hpp"
+#include "pg_util.hpp"
 #include "util.hpp"
 
 ABSL_FLAG(std::string, db_conn,
@@ -105,7 +106,7 @@ struct Row {
 
 bool RunQuery(PGconn* conn, const std::string& sql, std::vector<Row>* out) {
   out->clear();
-  PGresult* r = PQexec(conn, sql.c_str());
+  PGresult* r = onvif::pg::ExecWithTimeout(conn, -1, sql.c_str());
   if (PQresultStatus(r) != PGRES_TUPLES_OK) {
     std::fprintf(stderr, "query failed: %s\nSQL: %s\n",
                  PQerrorMessage(conn), sql.c_str());
@@ -131,7 +132,7 @@ bool RunQuery(PGconn* conn, const std::string& sql, std::vector<Row>* out) {
 }
 
 bool RunStmt(PGconn* conn, const std::string& sql) {
-  PGresult* r = PQexec(conn, sql.c_str());
+  PGresult* r = onvif::pg::ExecWithTimeout(conn, -1, sql.c_str());
   ExecStatusType s = PQresultStatus(r);
   if (s != PGRES_COMMAND_OK && s != PGRES_TUPLES_OK) {
     std::fprintf(stderr, "exec failed: %s\nSQL: %s\n",

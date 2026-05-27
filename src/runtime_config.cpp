@@ -84,6 +84,22 @@ const std::vector<Entry>& Schema() {
      "NanoDet-M couldn't classify the motion event.  Default 'person'.  "
      "Other accepted values: 'vehicle', 'animal', 'package'.",
      "First-party cameras"},
+    {"motion_video_sample_secs", Type::Int,
+     "When > 0, motion_poller samples N seconds of video frames (1s apart) "
+     "from /api/cameras/<id>/snapshot?ts=<ms> starting at the real "
+     "motion-start moment, runs NanoDet-M on each, and uses the highest-"
+     "confidence security-relevant class.  A baseline frame at (start - 5s) "
+     "is subtracted so persistent scene objects (e.g. a parked car) do not "
+     "trigger on their own appearance.  N is capped at min(this value, "
+     "event length in seconds).  Set to 0 to disable and use only Protect's "
+     "stored cropped thumbnail.",
+     "First-party cameras"},
+    {"camera_video_sample_secs", Type::String,
+     "Per-camera overrides for motion_video_sample_secs as comma-separated "
+     "camera_id=secs pairs (camera IDs are 24-char hex from the cameras "
+     "table).  Useful when one camera benefits from more samples while "
+     "others can stay at the global default.",
+     "First-party cameras"},
     {"motion_backfill_days", Type::Int,
      "On startup, retry NanoDet-M classification on motion events from the "
      "last N days that didn't produce a smartDetectZone (e.g. because of "

@@ -360,6 +360,22 @@ cc_test(
     ],
 )
 
+# test_pg_util: integration-style tests for the async-with-timeout
+# libpq helper.  The DB-dependent tests skip cleanly when no postgres
+# is reachable (the default in Bazel sandbox / CI), so this test
+# target stays green by default.  To exercise the timeout / cancel /
+# PQreset paths against a real DB, set ONVIF_TEST_DB_CONN before
+# invoking `bazel test`.
+cc_test(
+    name = "test_pg_util",
+    srcs = ["test_pg_util.cpp"],
+    linkstatic = True,
+    deps = ["//:pg_util"] + select({
+        "@platforms//cpu:aarch64": ["@arm64_sysroot//:libpq"],
+        "//conditions:default":    ["//third_party:libpq"],
+    }),
+)
+
 filegroup(
     name = "bench_onvif_raw_log",
     srcs = ["testdata/bench_onvif.jsonl"],

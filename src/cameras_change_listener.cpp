@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "absl/log/log.h"
+#include "pg_util.hpp"
 
 namespace onvif {
 
@@ -100,7 +101,7 @@ void CamerasChangeListener::add_managed_camera(const std::string& id) {
 absl::Status CamerasChangeListener::install_trigger(void* pg_conn) {
   PGconn* conn = static_cast<PGconn*>(pg_conn);
 
-  PGresult* r = PQexec(conn, kTriggerFnSql);
+  PGresult* r = onvif::pg::ExecWithTimeout(conn, -1, kTriggerFnSql);
   if (PQresultStatus(r) != PGRES_COMMAND_OK) {
     std::string err = PQresultErrorMessage(r);
     PQclear(r);
@@ -108,7 +109,7 @@ absl::Status CamerasChangeListener::install_trigger(void* pg_conn) {
   }
   PQclear(r);
 
-  r = PQexec(conn, kTriggerDropSql);
+  r = onvif::pg::ExecWithTimeout(conn, -1, kTriggerDropSql);
   if (PQresultStatus(r) != PGRES_COMMAND_OK) {
     std::string err = PQresultErrorMessage(r);
     PQclear(r);
@@ -116,7 +117,7 @@ absl::Status CamerasChangeListener::install_trigger(void* pg_conn) {
   }
   PQclear(r);
 
-  r = PQexec(conn, kTriggerCreateSql);
+  r = onvif::pg::ExecWithTimeout(conn, -1, kTriggerCreateSql);
   if (PQresultStatus(r) != PGRES_COMMAND_OK) {
     std::string err = PQresultErrorMessage(r);
     PQclear(r);
@@ -172,7 +173,7 @@ void CamerasChangeListener::run() {
       continue;
     }
 
-    PGresult* r = PQexec(conn, "LISTEN onvif_recorder_camera_change");
+    PGresult* r = onvif::pg::ExecWithTimeout(conn, -1, "LISTEN onvif_recorder_camera_change");
     if (PQresultStatus(r) != PGRES_COMMAND_OK) {
       LOG(WARNING) << "[cameras_listener] LISTEN failed: "
                    << PQresultErrorMessage(r) << "; reconnecting in 30s";

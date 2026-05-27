@@ -35,6 +35,7 @@
 #include "jpeg_crop.hpp"
 #include "msr_client.hpp"
 #include "object_detect.hpp"
+#include "pg_util.hpp"
 #include "protect_user_id_provider.hpp"
 #include "protect_version.hpp"
 #include "ubv_thumbnail.hpp"
@@ -125,6 +126,30 @@ std::string build_sdo_attributes(const std::string& obj_type, int confidence) {
       + "\"vehicleType\":null,"
       + "\"zone\":[]"
       + "}";
+}
+
+int select_best_candidate_index(
+    const std::vector<std::string>& baseline_classes,
+    const std::vector<Candidate>& event_candidates) {
+  // Baseline lookup is O(N) per candidate -- baseline is usually 0-3
+  // entries so a hash set would be premature optimisation.
+  auto baseline_contains = [&](const std::string& cls) {
+    for (const auto& b : baseline_classes)
+      if (b == cls) return true;
+    return false;
+  };
+  int best_idx = -1;
+  int best_conf = -1;
+  for (size_t i = 0; i < event_candidates.size(); ++i) {
+    const auto& c = event_candidates[i];
+    if (baseline_contains(c.obj_type)) continue;
+    if (c.confidence_pct > best_conf) {
+      best_conf = c.confidence_pct;
+      best_idx = static_cast<int>(i);
+    }
+    // strictly > so the lowest index wins ties (earliest frame).
+  }
+  return best_idx;
 }
 
 std::string build_sdt_payload(uint64_t start_ms,
@@ -286,6 +311,27 @@ struct MotionPoller::Impl {
   bool always_smart_detect{true};
   std::string fallback_object_type{"person"};
 
+  // Time-travel sampling: global cap and per-camera overrides.
+  // 0 means "disabled" (poller stays on the legacy single-snapshot path).
+  int video_sample_global_secs{0};
+  std::map<std::string, int> video_sample_per_camera;
+
+  // Effective N for a given camera + event length, clamped to [1, cap].
+  // Returns 0 when sampling is disabled for this camera.
+  int effective_sample_secs(const std::string& cam_id,
+                             uint64_t start_ms, uint64_t end_ms) const {
+    int cap = video_sample_global_secs;
+    auto it = video_sample_per_camera.find(cam_id);
+    if (it != video_sample_per_camera.end()) cap = it->second;
+    if (cap <= 0) return 0;
+    const int64_t span_ms = (end_ms > start_ms)
+        ? static_cast<int64_t>(end_ms - start_ms) : 0;
+    // Round up to whole seconds: a 6.5s event still gets up to 7 samples
+    // if the cap allows.
+    const int event_secs = static_cast<int>((span_ms + 999) / 1000);
+    return std::max(1, std::min(cap, std::max(1, event_secs)));
+  }
+
   ~Impl() {
     if (conn) PQfinish(conn);
   }
@@ -361,6 +407,13 @@ void MotionPoller::set_coalesce_window(uint32_t sec) {
   impl_->coalesce_window_sec = sec;
 }
 
+void MotionPoller::set_video_sample_secs(
+    int global_secs,
+    const std::map<std::string, int>& per_camera) {
+  impl_->video_sample_global_secs = global_secs;
+  impl_->video_sample_per_camera = per_camera;
+}
+
 void MotionPoller::set_use_msr_thumbnail_ids(bool use_msr) {
   impl_->use_msr_thumb_ids = use_msr;
 }
@@ -397,7 +450,7 @@ void MotionPoller::init_high_water_marks() {
     impl_->maybe_reconnect();
     const std::string def_str = std::to_string(default_hwm);
     const char* params[] = { def_str.c_str(), cam_id.c_str() };
-    PGresult* res = PQexecParams(impl_->conn,
+    PGresult* res = onvif::pg::ExecParamsWithTimeout(impl_->conn, -1,
       "SELECT COALESCE(MAX(e.start), $1::bigint) "
       "FROM events e "
       "WHERE e.type = 'smartDetectZone' "
@@ -451,7 +504,7 @@ void MotionPoller::log_event_type_breakdown(const char* label) {
   for (const auto& cam_id : impl_->camera_ids) {
     impl_->maybe_reconnect();
     const char* params[] = { cam_id.c_str(), since_str.c_str() };
-    PGresult* res = PQexecParams(impl_->conn,
+    PGresult* res = onvif::pg::ExecParamsWithTimeout(impl_->conn, -1,
       "SELECT type, COUNT(*) FROM events "
       "WHERE \"cameraId\" = $1 AND start > $2::bigint "
       "GROUP BY type ORDER BY 2 DESC",
@@ -537,7 +590,7 @@ void MotionPoller::poll_loop() {
       // filter.  Lets the journal show "we had candidates but Protect
       // already classified them" -- otherwise they're invisible.
       {
-        PGresult* res_d = PQexecParams(impl_->conn,
+        PGresult* res_d = onvif::pg::ExecParamsWithTimeout(impl_->conn, -1,
           "SELECT COUNT(*) FROM events e "
           "WHERE e.type = 'motion' "
           "  AND e.\"cameraId\" = $1 "
@@ -566,7 +619,7 @@ void MotionPoller::poll_loop() {
       // minus prePaddingSecs"; the real motion moment is start + prePad.
       // We use that to fetch a snapshot at the actual detection moment
       // instead of Protect's chosen (often late / off-centre) thumbnail.
-      PGresult* res = PQexecParams(impl_->conn,
+      PGresult* res = onvif::pg::ExecParamsWithTimeout(impl_->conn, -1,
         "SELECT e.id, e.start, e.\"end\", e.\"cameraId\", e.\"thumbnailId\", "
         "       COALESCE("
         "         (c.\"recordingSettings\"::jsonb->>'prePaddingSecs')::int,"
@@ -622,85 +675,174 @@ void MotionPoller::poll_loop() {
                   << " prePad=" << pre_padding_secs << "s"
                   << " realStart=" << real_motion_start_ms;
 
-        // Fetch TWO candidate images for NanoDet-M and try both:
-        //
-        //   A. /api/cameras/<id>/snapshot?ts=<ms>  -- wide-angle, but Protect
-        //      serves the Low channel (640x360) which leaves a mid-distance
-        //      person at ~50 px after NanoDet's 320x320 resize -- below the
-        //      0.4 confidence threshold.
-        //   B. /api/thumbnails/<id>                 -- 360x360 image cropped
-        //      tight around Protect's motion centroid.  Subject occupies far
-        //      more of the frame so NanoDet's resize keeps it ~150 px.
-        //
-        // Historically (pre-df276a9) we used only (B); first-party detections
-        // worked well.  df276a9 switched to (A) under the theory "we should
-        // see the full FOV so we don't miss off-centre subjects", but Protect
-        // ships only the low-res channel through that endpoint, killing
-        // detection rate.  The fix is to use whichever image NanoDet finds
-        // something in; if (B) has the centroid wrong, (A) covers the wider
-        // scene as a fallback.
-        std::vector<uint8_t> jpeg_wide;   // (A) wide 640x360
-        std::vector<uint8_t> jpeg_crop;   // (B) cropped 360x360
-
-        if (!impl_->protect_url.empty() && impl_->protect_user_id_provider) {
-          jpeg_wide = fetch_camera_snapshot_at_ts(
-              impl_->protect_url, impl_->protect_user_id_provider,
-              cam_id, real_motion_start_ms);
-        }
-        // Thumbnail-by-id: 24-char IDs live in the `thumbnails` Postgres
-        // table; anything else (MSR "{MAC}-{ts}" form) is served by msp via
-        // /api/thumbnails/<id>.
-        if (thumb_id.size() == 24) {
-          impl_->maybe_reconnect();
-          const char* tp[] = { thumb_id.c_str() };
-          PGresult* thumb_res = PQexecParams(impl_->conn,
-            "SELECT content FROM thumbnails WHERE id = $1",
-            1, nullptr, tp, nullptr, nullptr, 1);
-          if (PQresultStatus(thumb_res) == PGRES_TUPLES_OK &&
-              PQntuples(thumb_res) > 0 &&
-              !PQgetisnull(thumb_res, 0, 0)) {
-            const char* raw = PQgetvalue(thumb_res, 0, 0);
-            const int raw_len = PQgetlength(thumb_res, 0, 0);
-            jpeg_crop.assign(raw, raw + raw_len);
-          }
-          PQclear(thumb_res);
-        } else if (!impl_->protect_url.empty() &&
-                   impl_->protect_user_id_provider &&
-                   !impl_->protect_user_id_provider->empty()) {
-          jpeg_crop = fetch_thumbnail_via_protect(
-              impl_->protect_url, impl_->protect_user_id_provider, thumb_id);
-        }
-
-        if (jpeg_wide.empty() && jpeg_crop.empty()) {
-          LOG(INFO) << "[motion_poller] skip event " << ev_id
-                    << ": no snapshot or thumbnail available";
-          ++hb_skipped_no_thumb;
-          impl_->hwm[cam_id] = start_ms;
-          continue;
-        }
-
-        LOG(INFO) << "[motion_poller] event " << ev_id
-                  << ": running NanoDet-M on "
-                  << (jpeg_wide.empty()
-                          ? ""
-                          : "snapshot(" + std::to_string(jpeg_wide.size()) + "B) ")
-                  << (jpeg_crop.empty()
-                          ? ""
-                          : "thumb(" + std::to_string(jpeg_crop.size()) + "B)");
-
-        // Try the tight-crop image first -- empirically higher hit rate
-        // because the subject occupies more of the frame.  Fall back to
-        // the wide snapshot if the crop comes up empty.
+        // Output of the classification stage below: the JPEG that produced
+        // `det` (used downstream for thumbnail cropping + MSR upload) and
+        // the Detection itself.  Either of three paths can populate it:
+        //   1. Time-travel sampling (preferred when enabled): N frames at
+        //      1s offsets from real_motion_start_ms, with a baseline frame
+        //      at -5s subtracted from the class set.
+        //   2. Legacy single-snapshot + cropped-thumb (fallback).
+        //   3. always-smart-detect fallback (no detection, just write the
+        //      event tagged with fallback_object_type and confidence=0).
         std::optional<object_detect::Detection> det;
-        std::vector<uint8_t> jpeg;  // the image that actually produced det
-        for (const auto* candidate : {&jpeg_crop, &jpeg_wide}) {
-          if (candidate->empty()) continue;
-          auto d = impl_->detector->detect(*candidate);
-          if (d.has_value() &&
-              object_detect::is_security_relevant(d->class_id)) {
-            det = d;
-            jpeg = *candidate;
-            break;
+        std::vector<uint8_t> jpeg;  // image that actually produced det
+        std::vector<uint8_t> jpeg_wide;   // (A) wide 640x360 (legacy fallback)
+        std::vector<uint8_t> jpeg_crop;   // (B) cropped 360x360 (legacy fallback)
+
+        // ----- (1) Time-travel video sampling -----------------------------
+        const int sample_secs = impl_->effective_sample_secs(
+            cam_id, start_ms, end_ms);
+        if (sample_secs > 0 && !impl_->protect_url.empty() &&
+            impl_->protect_user_id_provider) {
+          // Baseline at real_motion_start - 5s: enumerate all classes
+          // already in the scene so we can subtract them below.
+          std::vector<std::string> baseline_classes;
+          const uint64_t baseline_ts =
+              real_motion_start_ms > 5000ULL ? real_motion_start_ms - 5000ULL
+                                              : 0ULL;
+          if (baseline_ts > 0) {
+            auto baseline_jpeg = fetch_camera_snapshot_at_ts(
+                impl_->protect_url, impl_->protect_user_id_provider,
+                cam_id, baseline_ts);
+            if (!baseline_jpeg.empty()) {
+              const auto bdets = impl_->detector->detect_all(baseline_jpeg);
+              for (const auto& d : bdets)
+                baseline_classes.push_back(
+                    object_detect::detection_type(d.class_id));
+            }
+          }
+
+          // N event frames at +0, +1s, ..., +(N-1)s.  We keep every
+          // frame's JPEG in memory so we can pick the winning one after
+          // baseline subtraction; ~30 KB × 5 = 150 KB worst case.
+          std::vector<std::vector<uint8_t>>           frame_jpegs;
+          std::vector<object_detect::Detection>       frame_dets_flat;
+          std::vector<int>                             frame_dets_jpeg_idx;
+          std::vector<motion_poller_internal::Candidate> candidates;
+
+          for (int s = 0; s < sample_secs && running_.load(); ++s) {
+            const uint64_t ts =
+                real_motion_start_ms + static_cast<uint64_t>(s) * 1000ULL;
+            auto frame = fetch_camera_snapshot_at_ts(
+                impl_->protect_url, impl_->protect_user_id_provider,
+                cam_id, ts);
+            if (frame.empty()) continue;
+            const auto fdets = impl_->detector->detect_all(frame);
+            if (fdets.empty()) {
+              // Even if nothing classified, keep the JPEG -- the last
+              // resort fallback path below may still use it as the
+              // thumbnail image.
+              continue;
+            }
+            frame_jpegs.push_back(std::move(frame));
+            const int jpeg_idx = static_cast<int>(frame_jpegs.size()) - 1;
+            for (const auto& d : fdets) {
+              frame_dets_flat.push_back(d);
+              frame_dets_jpeg_idx.push_back(jpeg_idx);
+              candidates.push_back({
+                  object_detect::detection_type(d.class_id),
+                  std::max(0, std::min(100,
+                      static_cast<int>(std::lround(d.confidence * 100.0f))))
+              });
+            }
+          }
+
+          LOG(INFO) << "[motion_poller] event " << ev_id
+                    << ": time-travel sample N=" << sample_secs
+                    << " baseline_classes=" << baseline_classes.size()
+                    << " event_frames_with_dets=" << frame_jpegs.size()
+                    << " event_candidates=" << candidates.size();
+
+          const int winner = motion_poller_internal::select_best_candidate_index(
+              baseline_classes, candidates);
+          if (winner >= 0) {
+            det = frame_dets_flat[winner];
+            jpeg = std::move(frame_jpegs[frame_dets_jpeg_idx[winner]]);
+            LOG(INFO) << "[motion_poller] event " << ev_id
+                      << ": time-travel HIT class="
+                      << object_detect::detection_type(det->class_id)
+                      << " conf=" << candidates[winner].confidence_pct;
+          } else if (!candidates.empty()) {
+            LOG(INFO) << "[motion_poller] event " << ev_id
+                      << ": time-travel suppressed (all classes in baseline)";
+          }
+
+          // If sampling produced a JPEG but no winning detection, keep
+          // the first sampled JPEG as the fallback "wide" image so the
+          // thumbnail still looks reasonable when the always-smart-detect
+          // path writes a confidence=0 row.
+          if (!det.has_value() && !frame_jpegs.empty())
+            jpeg_wide = std::move(frame_jpegs.front());
+        }
+
+        // ----- (2) Legacy single-snapshot + cropped-thumb -----------------
+        // Skipped entirely when sampling already produced a hit.  Still runs
+        // when sampling ran-but-missed (the legacy crop-thumb sometimes
+        // catches things the wide sampling misses, e.g. a small/distant
+        // subject Protect cropped onto and that the 640x360 wide downscale
+        // squashes below NanoDet's confidence threshold).
+        if (!det.has_value()) {
+          if (jpeg_wide.empty() && !impl_->protect_url.empty() &&
+              impl_->protect_user_id_provider) {
+            jpeg_wide = fetch_camera_snapshot_at_ts(
+                impl_->protect_url, impl_->protect_user_id_provider,
+                cam_id, real_motion_start_ms);
+          }
+          // Thumbnail-by-id: 24-char IDs live in the `thumbnails` Postgres
+          // table; anything else (MSR "{MAC}-{ts}" form) is served by msp
+          // via /api/thumbnails/<id>.
+          if (thumb_id.size() == 24) {
+            impl_->maybe_reconnect();
+            const char* tp[] = { thumb_id.c_str() };
+            PGresult* thumb_res = onvif::pg::ExecParamsWithTimeout(impl_->conn, -1,
+              "SELECT content FROM thumbnails WHERE id = $1",
+              1, nullptr, tp, nullptr, nullptr, 1);
+            if (PQresultStatus(thumb_res) == PGRES_TUPLES_OK &&
+                PQntuples(thumb_res) > 0 &&
+                !PQgetisnull(thumb_res, 0, 0)) {
+              const char* raw = PQgetvalue(thumb_res, 0, 0);
+              const int raw_len = PQgetlength(thumb_res, 0, 0);
+              jpeg_crop.assign(raw, raw + raw_len);
+            }
+            PQclear(thumb_res);
+          } else if (!impl_->protect_url.empty() &&
+                     impl_->protect_user_id_provider &&
+                     !impl_->protect_user_id_provider->empty()) {
+            jpeg_crop = fetch_thumbnail_via_protect(
+                impl_->protect_url, impl_->protect_user_id_provider, thumb_id);
+          }
+
+          if (jpeg_wide.empty() && jpeg_crop.empty()) {
+            LOG(INFO) << "[motion_poller] skip event " << ev_id
+                      << ": no snapshot or thumbnail available";
+            ++hb_skipped_no_thumb;
+            impl_->hwm[cam_id] = start_ms;
+            continue;
+          }
+
+          LOG(INFO) << "[motion_poller] event " << ev_id
+                    << ": running legacy NanoDet-M on "
+                    << (jpeg_wide.empty()
+                            ? ""
+                            : "snapshot(" + std::to_string(jpeg_wide.size())
+                                  + "B) ")
+                    << (jpeg_crop.empty()
+                            ? ""
+                            : "thumb(" + std::to_string(jpeg_crop.size())
+                                  + "B)");
+
+          // Try the tight-crop image first -- empirically higher hit rate
+          // because the subject occupies more of the frame.  Fall back to
+          // the wide snapshot if the crop comes up empty.
+          for (const auto* candidate : {&jpeg_crop, &jpeg_wide}) {
+            if (candidate->empty()) continue;
+            auto d = impl_->detector->detect(*candidate);
+            if (d.has_value() &&
+                object_detect::is_security_relevant(d->class_id)) {
+              det = d;
+              jpeg = *candidate;
+              break;
+            }
           }
         }
 
@@ -834,7 +976,7 @@ void MotionPoller::poll_loop() {
               now_str.c_str(), now_str.c_str(), end_str.c_str(),
               conf_str.c_str()
             };
-            PGresult* r = PQexecParams(impl_->conn,
+            PGresult* r = onvif::pg::ExecParamsWithTimeout(impl_->conn, -1,
               "INSERT INTO events"
               " (id, type, start, \"cameraId\", score, \"smartDetectTypes\","
               "  metadata, locked, \"thumbnailId\", \"createdAt\","
@@ -859,7 +1001,7 @@ void MotionPoller::poll_loop() {
               rich_metadata.c_str(),
               new_thumb_id.c_str(),  // TODO: separate full-FOV thumb id
             };
-            PGresult* r = PQexecParams(impl_->conn,
+            PGresult* r = onvif::pg::ExecParamsWithTimeout(impl_->conn, -1,
               "INSERT INTO events"
               " (id, type, start, \"cameraId\", score, \"smartDetectTypes\","
               "  metadata, locked, \"thumbnailId\", \"createdAt\","
@@ -885,7 +1027,7 @@ void MotionPoller::poll_loop() {
             cam_id.c_str(), obj_type.c_str(), attr_json.c_str(),
             ts_str.c_str(), now_str.c_str(), now_str.c_str()
           };
-          PGresult* r = PQexecParams(impl_->conn,
+          PGresult* r = onvif::pg::ExecParamsWithTimeout(impl_->conn, -1,
             "INSERT INTO \"smartDetectObjects\""
             " (id, \"eventId\", \"thumbnailId\", \"cameraId\", type,"
             "  attributes, \"detectedAt\", metadata,"
@@ -927,7 +1069,7 @@ void MotionPoller::poll_loop() {
               " $3::bigint, $4::bigint, $5::bigint, $6::bigint,"
               " $7::bigint, $8::bigint)"
               " ON CONFLICT (id) DO NOTHING";
-          PGresult* r = PQexecParams(impl_->conn, sql.c_str(),
+          PGresult* r = onvif::pg::ExecParamsWithTimeout(impl_->conn, -1, sql.c_str(),
                                      8, nullptr, ap, nullptr, nullptr, 0);
           if (PQresultStatus(r) != PGRES_COMMAND_OK)
             LOG(WARNING) << "[motion_poller] insert sda: "
@@ -953,7 +1095,7 @@ void MotionPoller::poll_loop() {
             label_event_type.c_str(), label_sdt.c_str(),
             label_camera.c_str(),     label_zone.c_str()
           };
-          PGresult* ur = PQexecParams(impl_->conn,
+          PGresult* ur = onvif::pg::ExecParamsWithTimeout(impl_->conn, -1,
             "INSERT INTO labels (id, name, \"createdAt\", \"updatedAt\") "
             "VALUES (gen_random_uuid(), $1, NOW(), NOW()),"
             "       (gen_random_uuid(), $2, NOW(), NOW()),"
@@ -968,7 +1110,7 @@ void MotionPoller::poll_loop() {
 
           // Fetch the four lids in name order matching $1..$4.
           int lids[4] = {0, 0, 0, 0};
-          PGresult* lr = PQexecParams(impl_->conn,
+          PGresult* lr = onvif::pg::ExecParamsWithTimeout(impl_->conn, -1,
             "SELECT lid, name FROM labels "
             "WHERE name IN ($1, $2, $3, $4)",
             4, nullptr, up_p, nullptr, nullptr, 0);
@@ -998,7 +1140,7 @@ void MotionPoller::poll_loop() {
               now_str.c_str(), now_str.c_str(),
               dl_sdo_id.c_str(), sdo_id.c_str()
             };
-            PGresult* dlr = PQexecParams(impl_->conn,
+            PGresult* dlr = onvif::pg::ExecParamsWithTimeout(impl_->conn, -1,
               "INSERT INTO \"detectionLabels\""
               "  (id, \"eventId\", \"objectId\", labels,"
               "   \"createdAt\", \"updatedAt\") "
@@ -1027,7 +1169,7 @@ void MotionPoller::poll_loop() {
             sdtrk_id.c_str(), new_event_id.c_str(), cam_id.c_str(),
             sdtrk_payload.c_str(), now_str.c_str(), now_str.c_str()
           };
-          PGresult* r = PQexecParams(impl_->conn,
+          PGresult* r = onvif::pg::ExecParamsWithTimeout(impl_->conn, -1,
             "INSERT INTO \"smartDetectTracks\""
             " (id, \"eventId\", \"cameraId\", payload,"
             "  \"createdAt\", \"updatedAt\")"
@@ -1048,7 +1190,7 @@ void MotionPoller::poll_loop() {
             sdr_id.c_str(), cam_id.c_str(), payload.c_str(),
             ts_str.c_str(), now_str.c_str(), now_str.c_str()
           };
-          PGresult* r = PQexecParams(impl_->conn,
+          PGresult* r = onvif::pg::ExecParamsWithTimeout(impl_->conn, -1,
             "INSERT INTO \"smartDetectRaws\""
             " (id, \"cameraId\", payload, timestamp,"
             "  \"createdAt\", \"updatedAt\")"
@@ -1073,7 +1215,7 @@ void MotionPoller::poll_loop() {
           };
           const int lengths[] = { 0, 0, 0, 0, 0, 0, jpeg_len };
           const int formats[] = { 0, 0, 0, 0, 0, 0, 1 };  // last = binary
-          PGresult* r = PQexecParams(impl_->conn,
+          PGresult* r = onvif::pg::ExecParamsWithTimeout(impl_->conn, -1,
             "INSERT INTO thumbnails"
             " (id, \"cameraId\", \"eventId\", timestamp,"
             "  \"createdAt\", \"updatedAt\", content, \"isFullfov\")"

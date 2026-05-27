@@ -21,6 +21,7 @@
 #include <string>
 
 #include "absl/log/log.h"
+#include "pg_util.hpp"
 
 namespace onvif {
 namespace msr_backfill {
@@ -53,7 +54,7 @@ Stats run(const std::string& db_conn, MsrClient* msr, int days, bool apply) {
   // SQL to avoid libpq int-width portability concerns.
   const std::string days_str = std::to_string(days);
   const char* sel_params[1] = { days_str.c_str() };
-  PGresult* res = PQexecParams(conn,
+  PGresult* res = onvif::pg::ExecParamsWithTimeout(conn, -1,
       "SELECT e.id, e.\"thumbnailId\", e.\"cameraId\", e.start, c.mac "
       "FROM events e JOIN cameras c ON e.\"cameraId\" = c.id "
       "WHERE c.\"isThirdPartyCamera\" = true "
@@ -91,7 +92,7 @@ Stats run(const std::string& db_conn, MsrClient* msr, int days, bool apply) {
 
     // Fetch thumbnail bytes.
     const char* th_params[1] = { old_tid.c_str() };
-    PGresult* tr = PQexecParams(conn,
+    PGresult* tr = onvif::pg::ExecParamsWithTimeout(conn, -1,
         "SELECT content FROM thumbnails WHERE id = $1",
         1, nullptr, th_params, nullptr, nullptr, 1 /* want binary */);
     if (PQresultStatus(tr) != PGRES_TUPLES_OK) {
@@ -135,13 +136,13 @@ Stats run(const std::string& db_conn, MsrClient* msr, int days, bool apply) {
     }
 
     // Transactional DB update.
-    PGresult* br = PQexec(conn, "BEGIN");
+    PGresult* br = onvif::pg::ExecWithTimeout(conn, -1, "BEGIN");
     PQclear(br);
 
     bool tx_ok = true;
     {
       const char* p[2] = { new_tid.c_str(), event_id.c_str() };
-      PGresult* r = PQexecParams(conn,
+      PGresult* r = onvif::pg::ExecParamsWithTimeout(conn, -1,
           "UPDATE events SET \"thumbnailId\" = $1 WHERE id = $2",
           2, nullptr, p, nullptr, nullptr, 0);
       if (PQresultStatus(r) != PGRES_COMMAND_OK) {
@@ -153,7 +154,7 @@ Stats run(const std::string& db_conn, MsrClient* msr, int days, bool apply) {
     if (tx_ok) {
       const char* p[3] = { new_tid.c_str(), event_id.c_str(),
                            old_tid.c_str() };
-      PGresult* r = PQexecParams(conn,
+      PGresult* r = onvif::pg::ExecParamsWithTimeout(conn, -1,
           "UPDATE \"smartDetectObjects\" SET \"thumbnailId\" = $1 "
           "WHERE \"eventId\" = $2 AND \"thumbnailId\" = $3",
           3, nullptr, p, nullptr, nullptr, 0);
@@ -166,7 +167,7 @@ Stats run(const std::string& db_conn, MsrClient* msr, int days, bool apply) {
     }
     if (tx_ok) {
       const char* p[1] = { old_tid.c_str() };
-      PGresult* r = PQexecParams(conn,
+      PGresult* r = onvif::pg::ExecParamsWithTimeout(conn, -1,
           "DELETE FROM thumbnails WHERE id = $1",
           1, nullptr, p, nullptr, nullptr, 0);
       if (PQresultStatus(r) != PGRES_COMMAND_OK) {
@@ -177,7 +178,7 @@ Stats run(const std::string& db_conn, MsrClient* msr, int days, bool apply) {
     }
 
     if (tx_ok) {
-      PGresult* cr = PQexec(conn, "COMMIT");
+      PGresult* cr = onvif::pg::ExecWithTimeout(conn, -1, "COMMIT");
       if (PQresultStatus(cr) != PGRES_COMMAND_OK) {
         LOG(ERROR) << "[backfill] commit failed: " << pg_err(cr);
         tx_ok = false;
@@ -185,7 +186,7 @@ Stats run(const std::string& db_conn, MsrClient* msr, int days, bool apply) {
       PQclear(cr);
     }
     if (!tx_ok) {
-      PGresult* rr = PQexec(conn, "ROLLBACK");
+      PGresult* rr = onvif::pg::ExecWithTimeout(conn, -1, "ROLLBACK");
       PQclear(rr);
       ++s.failed_update;
       continue;

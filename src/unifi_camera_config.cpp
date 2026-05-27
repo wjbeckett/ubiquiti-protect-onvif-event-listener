@@ -27,6 +27,7 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "camera_change_log.hpp"
+#include "pg_util.hpp"
 
 namespace unifi {
 
@@ -129,6 +130,59 @@ std::string pg_array(const std::vector<std::string>& ids) {
   return out;
 }
 
+// Case-insensitive substring search.  Returns true when @p needle is found
+// anywhere in @p haystack.  Used to match Dahua/Amcrest model strings.
+static bool icontains(const std::string& haystack, const std::string& needle) {
+  if (needle.empty() || haystack.size() < needle.size()) return false;
+  for (size_t i = 0; i + needle.size() <= haystack.size(); ++i) {
+    bool match = true;
+    for (size_t j = 0; j < needle.size(); ++j) {
+      char a = haystack[i + j], b = needle[j];
+      if (a >= 'A' && a <= 'Z') a = static_cast<char>(a + ('a' - 'A'));
+      if (b >= 'A' && b <= 'Z') b = static_cast<char>(b + ('a' - 'A'));
+      if (a != b) { match = false; break; }
+    }
+    if (match) return true;
+  }
+  return false;
+}
+
+std::string maybe_rewrite_dahua_snapshot_url(const std::string& camera_type,
+                                              const std::string& original_url) {
+  // Vendor heuristic: Dahua and Dahua-OEM rebrands.  We intentionally match
+  // substrings of the cameras.type column ("Dahua DH-IPC-..." / "Amcrest"
+  // etc.) rather than vendor-tag any other way.  No vendor outside this set
+  // is known to serve the /onvif/snapshot path while needing /cgi-bin/...
+  // instead, so this is conservative.
+  const bool dahua_family = icontains(camera_type, "dahua") ||
+                            icontains(camera_type, "amcrest");
+  if (!dahua_family) return original_url;
+
+  // Find the path component start: after "://host[:port]".
+  // Look for the third '/' from the start (skipping the //).
+  const std::string sep = "://";
+  size_t after_scheme = original_url.find(sep);
+  if (after_scheme == std::string::npos) return original_url;
+  size_t path_start = original_url.find('/', after_scheme + sep.size());
+  if (path_start == std::string::npos) return original_url;
+
+  const std::string path_and_query = original_url.substr(path_start);
+  // Match if the path part is exactly "/onvif/snapshot" -- query string OK.
+  const std::string bad_path = "/onvif/snapshot";
+  if (path_and_query.compare(0, bad_path.size(), bad_path) != 0) {
+    return original_url;
+  }
+  // Only consider it a match if what follows the bad_path is end-of-string,
+  // '?' (query), or another '/' (sub-path).  Avoids false positives like
+  // "/onvif/snapshots-archive".
+  if (path_and_query.size() > bad_path.size()) {
+    char c = path_and_query[bad_path.size()];
+    if (c != '?' && c != '/') return original_url;
+  }
+
+  return original_url.substr(0, path_start) + "/cgi-bin/snapshot.cgi";
+}
+
 }  // namespace internal
 
 // ---------------------------------------------------------------------------
@@ -142,13 +196,13 @@ absl::StatusOr<std::vector<onvif::CameraConfig>> load_cameras(
     return absl::InternalError("unifi::load_cameras: " + pg.error());
 
   const char* sql =
-    "SELECT id, mac, host, \"thirdPartyCameraInfo\" "
+    "SELECT id, mac, host, \"thirdPartyCameraInfo\", COALESCE(type, '') "
     "FROM cameras "
     "WHERE \"isThirdPartyCamera\" = true "
     "  AND \"isAdopted\" = true "
     "  AND host IS NOT NULL";
 
-  PGresult* res = PQexec(pg.conn, sql);
+  PGresult* res = onvif::pg::ExecWithTimeout(pg.conn, -1, sql);
   if (PQresultStatus(res) != PGRES_TUPLES_OK) {
     std::string err = PQresultErrorMessage(res);
     PQclear(res);
@@ -162,6 +216,7 @@ absl::StatusOr<std::vector<onvif::CameraConfig>> load_cameras(
     const char* mac_c  = PQgetvalue(res, i, 1);
     const char* host_c = PQgetvalue(res, i, 2);
     const char* info_c = PQgetvalue(res, i, 3);
+    const char* type_c = PQgetvalue(res, i, 4);
     if (!id_c || !host_c || !info_c || PQgetisnull(res, i, 2)) continue;
 
     std::string info(info_c);
@@ -169,11 +224,27 @@ absl::StatusOr<std::vector<onvif::CameraConfig>> load_cameras(
     std::string password     = internal::json_get(info, "password");
     std::string snapshot_url = internal::json_get(info, "snapshotUrl");
     std::string port         = internal::json_get(info, "port");
+    std::string camera_type  = type_c ? std::string(type_c) : std::string();
     if (username.empty() || password.empty()) continue;
 
     std::string ip = host_c;
     if (!port.empty() && port != "80" && port != "0")
       ip += ":" + port;
+
+    // Auto-fix the well-known Dahua/Amcrest "advertises /onvif/snapshot but
+    // serves from /cgi-bin/snapshot.cgi" trap (issue #32).  The manual
+    // --camera_snapshot_urls flag still wins because it applies after this
+    // load step.  No-op for cameras that don't match the heuristic.
+    {
+      const std::string fixed =
+          internal::maybe_rewrite_dahua_snapshot_url(camera_type, snapshot_url);
+      if (fixed != snapshot_url) {
+        LOG(INFO) << "[unifi_camera_config] rewriting snapshotUrl for "
+                  << camera_type << " (" << ip << "): "
+                  << snapshot_url << " -> " << fixed;
+        snapshot_url = fixed;
+      }
+    }
 
     onvif::CameraConfig cam;
     cam.id       = std::string(id_c);
@@ -218,7 +289,7 @@ absl::StatusOr<std::vector<FirstPartyCamera>> load_first_party_cameras(
     "  AND \"isAdopted\" = true";
 
   const char* params[1] = { arr.c_str() };
-  PGresult* res = PQexecParams(pg.conn, sql, 1, nullptr, params,
+  PGresult* res = onvif::pg::ExecParamsWithTimeout(pg.conn, -1, sql, 1, nullptr, params,
                                nullptr, nullptr, 0);
   if (PQresultStatus(res) != PGRES_TUPLES_OK) {
     std::string err = PQresultErrorMessage(res);
@@ -272,7 +343,7 @@ absl::StatusOr<std::vector<CameraHealth>> load_camera_health(
     "WHERE c.\"isAdopted\" = true "
     "ORDER BY c.\"isThirdPartyCamera\" DESC, c.name";
 
-  PGresult* res = PQexec(pg.conn, sql);
+  PGresult* res = onvif::pg::ExecWithTimeout(pg.conn, -1, sql);
   if (PQresultStatus(res) != PGRES_TUPLES_OK) {
     std::string err = PQresultErrorMessage(res);
     PQclear(res);
@@ -336,7 +407,7 @@ load_recent_events(int limit, const DbConfig& db) {
     "LIMIT $1";
   const char* params[] = { limit_str.c_str() };
 
-  PGresult* res = PQexecParams(pg.conn, sql, 1, nullptr, params,
+  PGresult* res = onvif::pg::ExecParamsWithTimeout(pg.conn, -1, sql, 1, nullptr, params,
                                nullptr, nullptr, 0);
   if (PQresultStatus(res) != PGRES_TUPLES_OK) {
     std::string err = PQresultErrorMessage(res);
@@ -382,7 +453,7 @@ absl::StatusOr<std::vector<uint8_t>> load_thumbnail_bytes(
   const char* params[] = { thumbnail_id.c_str() };
   const int   formats[] = { 0 };
   (void)formats;
-  PGresult* res = PQexecParams(pg.conn,
+  PGresult* res = onvif::pg::ExecParamsWithTimeout(pg.conn, -1,
       "SELECT content FROM thumbnails WHERE id = $1",
       1, nullptr, params, nullptr, nullptr, /*resultFormat=*/1);
   if (PQresultStatus(res) != PGRES_TUPLES_OK) {
@@ -420,7 +491,7 @@ load_all_first_party(const DbConfig& db) {
     "  AND \"isAdopted\" = true "
     "ORDER BY name";
 
-  PGresult* res = PQexec(pg.conn, sql);
+  PGresult* res = onvif::pg::ExecWithTimeout(pg.conn, -1, sql);
   if (PQresultStatus(res) != PGRES_TUPLES_OK) {
     std::string err = PQresultErrorMessage(res);
     PQclear(res);
@@ -459,7 +530,7 @@ load_all_nonsmartdetect_first_party(const DbConfig& db) {
     "  AND (\"featureFlags\"::jsonb->>'hasSmartDetect' IS NULL "
     "       OR \"featureFlags\"::jsonb->>'hasSmartDetect' = 'false')";
 
-  PGresult* res = PQexec(pg.conn, sql);
+  PGresult* res = onvif::pg::ExecWithTimeout(pg.conn, -1, sql);
   if (PQresultStatus(res) != PGRES_TUPLES_OK) {
     std::string err = PQresultErrorMessage(res);
     PQclear(res);
@@ -519,7 +590,7 @@ load_first_party_cameras_by_model(
     "  AND \"isAdopted\" = true "
     "  AND " + where;
 
-  PGresult* res = PQexec(pg.conn, sql.c_str());
+  PGresult* res = onvif::pg::ExecWithTimeout(pg.conn, -1, sql.c_str());
   if (PQresultStatus(res) != PGRES_TUPLES_OK) {
     std::string err = PQresultErrorMessage(res);
     PQclear(res);
@@ -565,7 +636,7 @@ static absl::Status enable_smart_detect_impl(
       "       \"featureFlags\"::jsonb->'hasSmartDetect' "
       "FROM cameras WHERE id = $1";
     const char* p[1] = { cam_id.c_str() };
-    PGresult* sel = PQexecParams(conn, sel_sql, 1, nullptr, p,
+    PGresult* sel = onvif::pg::ExecParamsWithTimeout(conn, -1, sel_sql, 1, nullptr, p,
                                  nullptr, nullptr, 0);
     if (PQresultStatus(sel) == PGRES_TUPLES_OK && PQntuples(sel) > 0) {
       std::string old_sdt = PQgetisnull(sel, 0, 0)
@@ -601,7 +672,7 @@ static absl::Status enable_smart_detect_impl(
         "    OR (\"featureFlags\"::jsonb -> 'hasSmartDetect') <> 'true'::jsonb"
         "  )";
       const char* up[2] = { cam_id.c_str(), kSmartDetectSettings };
-      PGresult* upd = PQexecParams(conn, upd_sql, 2, nullptr, up,
+      PGresult* upd = onvif::pg::ExecParamsWithTimeout(conn, -1, upd_sql, 2, nullptr, up,
                                    nullptr, nullptr, 0);
       if (PQresultStatus(upd) != PGRES_COMMAND_OK) {
         std::string err = PQresultErrorMessage(upd);
@@ -649,7 +720,7 @@ static absl::Status enable_smart_detect_impl(
     "    OR (\"featureFlags\"::jsonb -> 'hasSmartDetect') <> 'true'::jsonb"
     "  )";
   const char* params[2] = { cam_id.c_str(), kSmartDetectSettings };
-  PGresult* res = PQexecParams(conn, sql, 2, nullptr, params,
+  PGresult* res = onvif::pg::ExecParamsWithTimeout(conn, -1, sql, 2, nullptr, params,
                                nullptr, nullptr, 0);
   if (PQresultStatus(res) != PGRES_COMMAND_OK) {
     std::string err = PQresultErrorMessage(res);
@@ -729,7 +800,7 @@ static absl::Status ensure_zones_impl(
         "  AND (\"smartDetectZones\" IS NULL "
         "       OR \"smartDetectZones\"::jsonb = '[]'::jsonb)";
       const char* p[1] = { id.c_str() };
-      PGresult* sel = PQexecParams(conn, sel_sql, 1, nullptr, p,
+      PGresult* sel = onvif::pg::ExecParamsWithTimeout(conn, -1, sel_sql, 1, nullptr, p,
                                    nullptr, nullptr, 0);
       if (PQresultStatus(sel) != PGRES_TUPLES_OK || PQntuples(sel) == 0) {
         PQclear(sel);
@@ -747,7 +818,7 @@ static absl::Status ensure_zones_impl(
         "  AND (\"smartDetectZones\" IS NULL "
         "       OR \"smartDetectZones\"::jsonb = '[]'::jsonb)";
       const char* up[2] = { kDefaultZone, id.c_str() };
-      PGresult* upd = PQexecParams(conn, upd_sql, 2, nullptr, up,
+      PGresult* upd = onvif::pg::ExecParamsWithTimeout(conn, -1, upd_sql, 2, nullptr, up,
                                    nullptr, nullptr, 0);
       if (PQresultStatus(upd) != PGRES_COMMAND_OK) {
         std::string err = PQresultErrorMessage(upd);
@@ -773,7 +844,7 @@ static absl::Status ensure_zones_impl(
     "  AND (\"smartDetectZones\" IS NULL "
     "       OR \"smartDetectZones\"::jsonb = '[]'::jsonb)";
   const char* params[2] = { kDefaultZone, arr.c_str() };
-  PGresult* res = PQexecParams(conn, sql, 2, nullptr, params,
+  PGresult* res = onvif::pg::ExecParamsWithTimeout(conn, -1, sql, 2, nullptr, params,
                                nullptr, nullptr, 0);
   if (PQresultStatus(res) != PGRES_COMMAND_OK) {
     std::string err = PQresultErrorMessage(res);
@@ -846,7 +917,7 @@ absl::Status set_rtsp_audio(bool enable, const DbConfig& db,
       "WHERE \"isThirdPartyCamera\" = true "
       "  AND \"isAdopted\" = true "
       "  AND (\"thirdPartyCameraInfo\"::jsonb->>'hasAudio') = 'true'";
-    PGresult* sel = PQexec(pg.conn, sel_sql);
+    PGresult* sel = onvif::pg::ExecWithTimeout(pg.conn, -1, sel_sql);
     if (PQresultStatus(sel) == PGRES_TUPLES_OK) {
       int nrows = PQntuples(sel);
       for (int i = 0; i < nrows; ++i) {
@@ -876,7 +947,7 @@ absl::Status set_rtsp_audio(bool enable, const DbConfig& db,
     "  AND (\"thirdPartyCameraInfo\"::jsonb->>'hasAudio') = 'true'";
 
   const char* params[1] = { val };
-  PGresult* res = PQexecParams(pg.conn, sql, 1, nullptr, params,
+  PGresult* res = onvif::pg::ExecParamsWithTimeout(pg.conn, -1, sql, 1, nullptr, params,
                                nullptr, nullptr, 0);
   if (PQresultStatus(res) != PGRES_COMMAND_OK) {
     std::string err = PQresultErrorMessage(res);
@@ -994,7 +1065,7 @@ absl::StatusOr<int> rollback_camera_changes(
         val = "[]";
       }
       const char* params[2] = { val.c_str(), cam_id.c_str() };
-      PGresult* res = PQexecParams(pg.conn, sql.c_str(), 2, nullptr, params,
+      PGresult* res = onvif::pg::ExecParamsWithTimeout(pg.conn, -1, sql.c_str(), 2, nullptr, params,
                                    nullptr, nullptr, 0);
       if (PQresultStatus(res) != PGRES_COMMAND_OK) {
         LOG(WARNING) << "[rollback] failed for camera " << cam_id
@@ -1034,7 +1105,7 @@ absl::StatusOr<int> rollback_camera_changes(
       "WHERE \"isThirdPartyCamera\" = true "
       "  AND \"isAdopted\" = true";
 
-    PGresult* res = PQexec(pg.conn, sql);
+    PGresult* res = onvif::pg::ExecWithTimeout(pg.conn, -1, sql);
     if (PQresultStatus(res) != PGRES_COMMAND_OK) {
       std::string err = PQresultErrorMessage(res);
       PQclear(res);
@@ -1077,7 +1148,7 @@ absl::StatusOr<bool> detect_native_msr_thumbnail_format(const DbConfig& db) {
     "ORDER BY e.start DESC "
     "LIMIT 1";
 
-  PGresult* res = PQexec(pg.conn, sql);
+  PGresult* res = onvif::pg::ExecWithTimeout(pg.conn, -1, sql);
   if (PQresultStatus(res) != PGRES_TUPLES_OK) {
     std::string err = PQresultErrorMessage(res);
     PQclear(res);

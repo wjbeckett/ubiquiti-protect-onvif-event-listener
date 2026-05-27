@@ -139,6 +139,91 @@ static void test_pg_array_multiple() {
         "pg_array: multiple elements");
 }
 
+// ---------------------------------------------------------------
+// maybe_rewrite_dahua_snapshot_url (issue #32)
+// ---------------------------------------------------------------
+static void test_dahua_rewrite_basic() {
+  // Exact-type "Dahua" + /onvif/snapshot path -> rewrites to /cgi-bin/...
+  const std::string in  = "http://192.168.1.24/onvif/snapshot?channel=1&subtype=0";
+  const std::string out = unifi::internal::maybe_rewrite_dahua_snapshot_url(
+      "Dahua", in);
+  check(out == "http://192.168.1.24/cgi-bin/snapshot.cgi",
+        "dahua-rewrite: bare 'Dahua' + /onvif/snapshot path");
+}
+
+static void test_dahua_rewrite_model_substring() {
+  // "Dahua DH-IPC-..." should also match.
+  const std::string in  = "http://10.0.0.50:8080/onvif/snapshot";
+  const std::string out = unifi::internal::maybe_rewrite_dahua_snapshot_url(
+      "Dahua DH-IPC-HFW3549T1-ZAS-PV", in);
+  check(out == "http://10.0.0.50:8080/cgi-bin/snapshot.cgi",
+        "dahua-rewrite: model-string substring + host:port preserved");
+}
+
+static void test_dahua_rewrite_amcrest_alias() {
+  // Amcrest = Dahua OEM; same path bug, same fix.
+  const std::string in  = "http://172.16.0.5/onvif/snapshot?channel=1";
+  const std::string out = unifi::internal::maybe_rewrite_dahua_snapshot_url(
+      "Amcrest IP4M-1051", in);
+  check(out == "http://172.16.0.5/cgi-bin/snapshot.cgi",
+        "dahua-rewrite: Amcrest alias triggers rewrite");
+}
+
+static void test_dahua_rewrite_case_insensitive() {
+  // Type matching is case-insensitive.
+  const std::string in  = "http://192.168.1.1/onvif/snapshot";
+  const std::string out = unifi::internal::maybe_rewrite_dahua_snapshot_url(
+      "dAhUa whatever", in);
+  check(out == "http://192.168.1.1/cgi-bin/snapshot.cgi",
+        "dahua-rewrite: case-insensitive type match");
+}
+
+static void test_dahua_rewrite_non_dahua_passthrough() {
+  // Non-Dahua cameras pass through unchanged even when they advertise the
+  // same path -- belt-and-suspenders: we only rewrite known-broken vendors.
+  const std::string in  = "http://192.168.1.10/onvif/snapshot?channel=1";
+  const std::string out = unifi::internal::maybe_rewrite_dahua_snapshot_url(
+      "Hikvision DS-2CD2", in);
+  check(out == in, "dahua-rewrite: non-Dahua type passes through");
+}
+
+static void test_dahua_rewrite_non_matching_path() {
+  // Right vendor, wrong path -> passes through.  E.g. a Dahua that for once
+  // advertises the cgi-bin URL correctly, or a non-broken sub-path.
+  const std::string in  = "http://192.168.1.24/cgi-bin/snapshot.cgi";
+  const std::string out = unifi::internal::maybe_rewrite_dahua_snapshot_url(
+      "Dahua", in);
+  check(out == in, "dahua-rewrite: already-correct URL passes through");
+}
+
+static void test_dahua_rewrite_false_positive_guard() {
+  // "/onvif/snapshots-archive" must NOT match /onvif/snapshot prefix.
+  const std::string in  = "http://192.168.1.1/onvif/snapshots-archive/index";
+  const std::string out = unifi::internal::maybe_rewrite_dahua_snapshot_url(
+      "Dahua", in);
+  check(out == in,
+        "dahua-rewrite: /onvif/snapshots-* does not match the bad path");
+}
+
+static void test_dahua_rewrite_malformed_url() {
+  // No scheme://host pattern -> pass through, don't crash.
+  const std::string in  = "not-a-url";
+  const std::string out = unifi::internal::maybe_rewrite_dahua_snapshot_url(
+      "Dahua", in);
+  check(out == in, "dahua-rewrite: malformed URL passes through");
+}
+
+static void test_dahua_rewrite_empty_inputs() {
+  check(unifi::internal::maybe_rewrite_dahua_snapshot_url("", "").empty(),
+        "dahua-rewrite: empty type + empty url");
+  check(unifi::internal::maybe_rewrite_dahua_snapshot_url(
+            "Dahua", "").empty(),
+        "dahua-rewrite: empty url passes through");
+  check(unifi::internal::maybe_rewrite_dahua_snapshot_url(
+            "", "http://x/onvif/snapshot") == "http://x/onvif/snapshot",
+        "dahua-rewrite: empty type does not match");
+}
+
 int main() {
   test_build_connstr_default();
   test_build_connstr_with_password();
@@ -154,6 +239,16 @@ int main() {
   test_pg_array_empty();
   test_pg_array_single();
   test_pg_array_multiple();
+
+  test_dahua_rewrite_basic();
+  test_dahua_rewrite_model_substring();
+  test_dahua_rewrite_amcrest_alias();
+  test_dahua_rewrite_case_insensitive();
+  test_dahua_rewrite_non_dahua_passthrough();
+  test_dahua_rewrite_non_matching_path();
+  test_dahua_rewrite_false_positive_guard();
+  test_dahua_rewrite_malformed_url();
+  test_dahua_rewrite_empty_inputs();
 
   std::cout << "test_unifi_camera_config: "
             << g_pass << " passed, " << g_fail << " failed\n";

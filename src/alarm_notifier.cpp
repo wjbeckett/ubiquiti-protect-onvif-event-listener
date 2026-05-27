@@ -31,6 +31,7 @@
 #include "contention_profiler.hpp"
 
 #include "absl/log/log.h"
+#include "pg_util.hpp"
 #include "util.hpp"
 
 namespace onvif {
@@ -429,8 +430,8 @@ void AlarmNotifier::record_history(const AutomationEntry& automation,
 
   const char* params[4] = {id.c_str(), automation.id.c_str(),
                            ts_buf, data.c_str()};
-  PGresult* res = PQexecParams(
-      conn,
+  PGresult* res = onvif::pg::ExecParamsWithTimeout(
+      conn, -1,
       "INSERT INTO \"automationsHistory\" "
       "(id, \"automationId\", timestamp, data, "
       " \"createdAt\", \"updatedAt\", \"usedInBreachDetection\") "
