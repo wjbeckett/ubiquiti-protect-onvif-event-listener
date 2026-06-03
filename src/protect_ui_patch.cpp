@@ -512,14 +512,21 @@ static absl::Status strip_nginx_block(const char* begin,
 }
 
 absl::Status patch_nginx_log_proxy(uint16_t port) {
+  // Same 401 -> 302-to-root redirect as patch_nginx_admin_proxy: an
+  // unauthenticated visitor pasting the log URL gets the UniFi OS login
+  // flow instead of a bare "401 Unauthorized".
   std::string block;
   block += kLogMarkerBegin;
   block += "    location /onvif/events/log {\n";
   block += "        include /usr/share/unifi-core/http/auth.conf;\n";
   block += "        include /usr/share/unifi-core/http/proxy.conf;\n";
+  block += "        error_page 401 = @onvif_log_unauth;\n";
   block += "        proxy_pass http://127.0.0.1:";
   block += std::to_string(port);
   block += "/;\n";
+  block += "    }\n";
+  block += "    location @onvif_log_unauth {\n";
+  block += "        return 302 /;\n";
   block += "    }\n";
   block += kLogMarkerEnd;
   return inject_nginx_block(block, kLogMarkerBegin, kLogMarkerEnd,
