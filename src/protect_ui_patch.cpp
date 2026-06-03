@@ -531,14 +531,24 @@ absl::Status revert_nginx_log_proxy() {
 }
 
 absl::Status patch_nginx_admin_proxy(uint16_t port) {
+  // When auth.conf's auth_request returns 401 (unauthenticated visitor),
+  // nginx would otherwise propagate a bare "401 Unauthorized" -- friendly
+  // for an XHR but jarring for a user who just pasted the admin URL into
+  // a browser.  Override 401 to a 302 redirect at the UniFi OS root,
+  // which presents the standard login flow.  On successful login the
+  // user can re-navigate to /onvif/admin/.
   std::string block;
   block += kAdminMarkerBegin;
   block += "    location /onvif/admin/ {\n";
   block += "        include /usr/share/unifi-core/http/auth.conf;\n";
   block += "        include /usr/share/unifi-core/http/proxy.conf;\n";
+  block += "        error_page 401 = @onvif_admin_unauth;\n";
   block += "        proxy_pass http://127.0.0.1:";
   block += std::to_string(port);
   block += "/;\n";
+  block += "    }\n";
+  block += "    location @onvif_admin_unauth {\n";
+  block += "        return 302 /;\n";
   block += "    }\n";
   block += kAdminMarkerEnd;
   return inject_nginx_block(block, kAdminMarkerBegin, kAdminMarkerEnd,
