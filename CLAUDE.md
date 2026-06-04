@@ -427,6 +427,25 @@ redeploy, re-soak.
 > If `gh` is unauthenticated, stop and re-authenticate (`gh auth login -h
 > github.com`) — never publish a release without the assets and notes.
 
+### Version-number convention: even vs odd patch
+
+The patch-level version number signals whether the build was published or
+not:
+
+- **Even patch numbers (`v1.6.0`, `v1.6.2`, `v1.6.4`, …) are GitHub
+  releases.** They have a `v*` tag, a `gh release` with notes, and both
+  `.deb` + `.exe` assets attached. They get promoted through apt suites
+  (`early-access` → `rc` → `stable`).
+- **Odd patch numbers (`1.6.1-dev*`, `1.6.3-dev*`, `1.6.5-dev*`, …) are
+  local-only dev builds.** They never get tagged, never get a GitHub
+  release, never go into the apt repo. They exist purely to deploy
+  in-flight code to the developer's own router for soak-testing.
+
+In practice: while iterating, ship as `1.6.<odd>-dev<n>` (`1.6.3-dev1`,
+`1.6.3-dev2`, …). When ready to release, **bump to the next even** —
+`1.6.4` — and run the release checklist below. Do *not* publish odd
+versions to GitHub; they're scratch space.
+
 ### Required release assets
 
 Every `v*` release MUST ship these two assets, and only these two:
