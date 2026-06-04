@@ -1559,7 +1559,7 @@ void DetectionRecorder::on_event(const OnvifEvent& ev) {
       db_->insert_smart_detect_raw(sdr_id, ev.camera_ip, ts_ms, obj_type, now_str);
       db_->insert_smart_detect_track(sdtrk_id, event_id, ev.camera_ip,
                                       ts_ms, ts_ms, obj_type,
-                                      /*confidence=*/0, now_str);
+                                      /*confidence=*/100, now_str);
       if (rich_path) {
         db_->insert_smart_detect_object_area(
             rich_area_id, sdo_id,
