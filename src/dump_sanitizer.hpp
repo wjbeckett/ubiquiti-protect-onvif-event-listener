@@ -37,6 +37,20 @@ namespace onvif {
 //   - HTTP basic credentials embedded in URLs (scheme://user:pass@host)
 //     and "Authorization: Basic <b64>" headers are replaced.
 //   - "X-UserId: <id>" and similar ID headers are replaced.
+//   - Sentry DSN URLs (https://<token>@<host>.ingest.sentry.io/<proj>)
+//     are collapsed to [REDACTED_SENTRY_DSN] before the URL / 32-hex
+//     rules run so nothing partial leaks.
+//   - Query-string session correlators (?uniqid=, requestId=,
+//     sessionId=) get their values blanked.
+//   - WebSocket path tokens (wss://host/<12+ base62 chars>) get the
+//     token portion replaced with [REDACTED_WS_TOKEN].
+//   - UUIDs (36-char 8-4-4-4-12 form), 24-hex Mongo-style IDs, and
+//     bare or colon-form MAC addresses are replaced with stable
+//     FNV-1a hash labels (uuid-<8hex> / id-<8hex> / mac-<8hex>) so
+//     cross-line correlation still works in a redacted dump while
+//     the original identifiers never leave the sanitiser.
+//   - Any 32-hex bare token (Sentry token, groupKey, generic 128-bit
+//     secret) becomes [REDACTED_HEX32].
 //   - User-given camera names that the caller has registered via
 //     register_camera_name() are replaced with a deterministic
 //     "Camera-<8hex>" hash of the name.  Names are personally

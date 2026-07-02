@@ -1150,6 +1150,31 @@ absl::Status build_diagnostic_dump(const Ctx& ctx,
   capture("nginx-error.log",
           "tail -n 500 /var/log/nginx/error.log 2>/dev/null "
           "|| echo '(nginx error log not readable)'");
+  // Protect-side logs.  Highest triage value for "video not found" /
+  // preview / stream-URL bug reports.  All go through the same
+  // DumpSanitizer pipeline as everything else in this dump — MACs,
+  // Mongo-style IDs, UUIDs, session tokens, and Sentry DSNs are
+  // hashed or blanked before the tarball is written.
+  //   protect-addon.log        UBV ListFragments trace (does video exist?)
+  //   protect-api.log          Every Protect API request from web/mobile
+  //   protect-grpc-client.log  Protect app -> MSR gRPC calls
+  //   protect-app.log          Bootstrap + middleware lifecycle
+  //   mst.log                  Media Server Transcoder decode/rescale ops
+  capture("protect-addon.log",
+          "tail -n 2000 /srv/unifi-protect/logs/addon.log 2>/dev/null "
+          "|| echo '(addon.log not readable)'");
+  capture("protect-api.log",
+          "tail -n 5000 /srv/unifi-protect/logs/api.log 2>/dev/null "
+          "|| echo '(api.log not readable)'");
+  capture("protect-grpc-client.log",
+          "tail -n 2000 /srv/unifi-protect/logs/GRPC.client.log 2>/dev/null "
+          "|| echo '(GRPC.client.log not readable)'");
+  capture("protect-app.log",
+          "tail -n 1000 /srv/unifi-protect/logs/app.log 2>/dev/null "
+          "|| echo '(app.log not readable)'");
+  capture("mst.log",
+          "tail -n 2000 /srv/ms/logs/mst.log 2>/dev/null "
+          "|| echo '(mst.log not readable)'");
   // Raw ONVIF SOAP exchange log — sourced from the always-on in-memory
   // ring (see RawSink in onvif_listener).  No flag required: the dump
   // always contains the most recent ~1000 exchanges (~8 MiB cap).

@@ -63,6 +63,14 @@ std::string camera_label(const std::string& name) {
   return "Camera-" + fnv1a_hex8(name);
 }
 
+// Deterministic short label for stable-hash redactions (MAC, Mongo ID,
+// UUID).  Cross-line correlation in a dump still works because the same
+// input always maps to the same 8-hex suffix, but the original value is
+// gone.
+std::string hash_label(const char* prefix, const std::string& value) {
+  return std::string(prefix) + fnv1a_hex8(value);
+}
+
 }  // namespace
 
 std::string DumpSanitizer::register_camera_name(const std::string& name) {
@@ -137,6 +145,16 @@ std::string regex_replace_with(const std::string& in,
 std::string DumpSanitizer::sanitize(const std::string& in) {
   std::string out = in;
 
+  // -------- Sentry DSN (must run before generic 32-hex + URL rules) --------
+  // Format: https://<32-hex-token>@<subdomain>.ingest.sentry.io/<projectid>
+  // Preserving just the host + project would still identify the tenant, so
+  // we collapse the whole DSN.  A leaked DSN allows event injection into
+  // Ubiquiti's Sentry.
+  static const std::regex sentry_dsn_re(
+      R"(https?://[0-9a-f]{32}@[^\s"'<>/]+\.ingest\.sentry\.io/\d+)",
+      std::regex::icase);
+  out = std::regex_replace(out, sentry_dsn_re, "[REDACTED_SENTRY_DSN]");
+
   // -------- IPv4 addresses --------
   // Word-bounded 4-octet pattern.  remap_ip() validates 0-255; out-of-
   // range matches are returned unchanged.
@@ -193,6 +211,75 @@ std::string DumpSanitizer::sanitize(const std::string& in) {
       R"((X-UserId:\s*)([A-Za-z0-9._\-]+))",
       std::regex::icase);
   out = std::regex_replace(out, xuserid_re, "$1[REDACTED]");
+
+  // -------- Query-string session values ---------
+  // Protect UI/API URLs carry per-request correlators (uniqid=ws-<uuid>,
+  // requestId=<...>, sessionId=<uuid>) that fingerprint an install.  We
+  // keep the key so URL structure stays parseable and blank the value.
+  static const std::regex session_qs_re(
+      R"(([?&](?:uniqid|requestId|sessionId))=([^&\s"'<>]+))",
+      std::regex::icase);
+  out = std::regex_replace(out, session_qs_re, "$1=[REDACTED]");
+
+  // -------- WebSocket path tokens ---------
+  // wss://host/<12+ base62 chars>?... appears in livestream redirect URLs
+  // in Protect's api.log.  The path token is a session-scoped play secret
+  // that shouldn't leave the install.
+  static const std::regex ws_path_re(
+      R"((wss?://[^/\s"'<>]+/)([A-Za-z0-9]{12,}))",
+      std::regex::icase);
+  out = std::regex_replace(out, ws_path_re, "$1[REDACTED_WS_TOKEN]");
+
+  // -------- UUIDs (36-char with dashes) ---------
+  // 8-4-4-4-12 hex.  Ironclad accessId, sessionId payload values, Protect
+  // livestream sessionIds, etc.  Stable-hashed so cross-line correlation
+  // still works.
+  static const std::regex uuid_re(
+      R"(\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-)"
+      R"([0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b)");
+  out = regex_replace_with(out, uuid_re, [](const std::smatch& m) {
+    return hash_label("uuid-", m.str(0));
+  });
+
+  // -------- 32-hex tokens (must run AFTER Sentry DSN) ---------
+  // Sentry auth tokens, groupKeys, generic 128-bit secrets.  Word-bounded
+  // with an explicit non-hex neighbour check because `\b` won't fire
+  // against `_` (an ECMAScript regex word char).
+  static const std::regex hex32_re(
+      R"((^|[^0-9a-fA-F])([0-9a-fA-F]{32})(?![0-9a-fA-F]))");
+  out = regex_replace_with(out, hex32_re, [](const std::smatch& m) {
+    return m.str(1) + "[REDACTED_HEX32]";
+  });
+
+  // -------- 24-hex Mongo-style IDs (must run BEFORE MAC bare 12-hex) ---
+  // Protect cameraIds, userIds, eventIds, thumbnailIds.  Absorbing these
+  // first ensures the MAC-bare rule below doesn't chew off the first 12
+  // characters of a Mongo ID that happens to be lowercase.
+  static const std::regex mongo_id_re(
+      R"((^|[^0-9a-fA-F])([0-9a-fA-F]{24})(?![0-9a-fA-F]))");
+  out = regex_replace_with(out, mongo_id_re, [](const std::smatch& m) {
+    return m.str(1) + hash_label("id-", m.str(2));
+  });
+
+  // -------- MAC address, colon form ---------
+  // AA:BB:CC:DD:EE:FF -- typically in Protect api.log request tags.
+  static const std::regex mac_colon_re(
+      R"((^|[^0-9A-Fa-f:])([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})(?![0-9A-Fa-f:]))");
+  out = regex_replace_with(out, mac_colon_re, [](const std::smatch& m) {
+    return m.str(1) + hash_label("mac-", m.str(2));
+  });
+
+  // -------- MAC address, bare 12-hex ---------
+  // F00000FDAED9 (in UBV paths, mst decode session tags, gRPC references).
+  // Runs after 24-hex Mongo IDs, so any lowercase 12-hex chunk that was
+  // part of a 24-hex ID is already redacted.  We stay case-insensitive
+  // because 12-hex-uppercase is what UBV paths use but some Protect
+  // components lowercase MACs before logging them.
+  static const std::regex mac_bare_re(
+      R"((^|[^0-9A-Fa-f])([0-9A-Fa-f]{12})(?![0-9A-Fa-f]))");
+  out = regex_replace_with(out, mac_bare_re, [](const std::smatch& m) {
+    return m.str(1) + hash_label("mac-", m.str(2));
+  });
 
   // -------- Registered camera names --------
   // Substitute longest names first to avoid swallowing parts of longer

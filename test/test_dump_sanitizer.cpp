@@ -245,6 +245,153 @@ static void test_sanitize_camera_name_deterministic() {
         "hash label is deterministic across instances");
 }
 
+// ---------------------------------------------------------------
+// Extended redactions for Protect-side log files.
+// All placeholder values below are synthetic — not from any real
+// dump — so no personally-identifying data ends up in the tree.
+// ---------------------------------------------------------------
+
+static void test_sanitize_sentry_dsn() {
+  onvif::DumpSanitizer s;
+  const std::string in =
+      R"("dsn":"https://11112222333344445555666677778888)"
+      R"(@example.ingest.sentry.io/12345")";
+  const std::string out = s.sanitize(in);
+  check(out.find("11112222333344445555666677778888") == std::string::npos,
+        "sentry token redacted");
+  check(out.find("sentry.io") == std::string::npos,
+        "sentry host also collapsed");
+  check(out.find("[REDACTED_SENTRY_DSN]") != std::string::npos,
+        "sentry DSN marker present");
+}
+
+static void test_sanitize_query_session_values() {
+  onvif::DumpSanitizer s;
+  const std::string out = s.sanitize(
+      "wss://host/livestream?uniqid=ws-abc123&sessionId=deadbeef&other=1&"
+      "requestId=r-9x");
+  check(out.find("uniqid=[REDACTED]") != std::string::npos,
+        "uniqid value blanked");
+  check(out.find("sessionId=[REDACTED]") != std::string::npos,
+        "sessionId value blanked");
+  check(out.find("requestId=[REDACTED]") != std::string::npos,
+        "requestId value blanked");
+  check(out.find("other=1") != std::string::npos,
+        "unrelated query params preserved");
+}
+
+static void test_sanitize_ws_path_token() {
+  onvif::DumpSanitizer s;
+  const std::string out = s.sanitize(
+      "livestream response {\"url\":\"wss://host:7446/AbCdEf1234567890"
+      "?camera=xyz\"}");
+  check(out.find("AbCdEf1234567890") == std::string::npos,
+        "ws path token redacted");
+  check(out.find("[REDACTED_WS_TOKEN]") != std::string::npos,
+        "ws token marker present");
+  check(out.find("wss://host:7446/") != std::string::npos,
+        "host + port preserved");
+}
+
+static void test_sanitize_uuid() {
+  onvif::DumpSanitizer s;
+  const std::string uuid = "0123abcd-4567-89ab-cdef-0123456789ab";
+  const std::string out = s.sanitize("sessionId=" + uuid);
+  // sessionId= query-string rule redacts the whole value, so we test
+  // the UUID rule directly in a non-query context.
+  const std::string out2 = s.sanitize("payload {\"accessId\":\"" + uuid + "\"}");
+  check(out2.find(uuid) == std::string::npos,
+        "UUID redacted outside query context");
+  check(out2.find("uuid-") != std::string::npos,
+        "UUID replaced with uuid-<hash> label");
+  // Deterministic across instances.
+  onvif::DumpSanitizer s2;
+  check(s.sanitize("x=" + uuid + " ") == s2.sanitize("x=" + uuid + " "),
+        "UUID hash deterministic");
+}
+
+static void test_sanitize_hex32_token() {
+  onvif::DumpSanitizer s;
+  const std::string tok = "aaaabbbbccccddddeeeeffff00001111";  // 32 hex
+  const std::string out = s.sanitize("groupKey=" + tok + ".");
+  check(out.find(tok) == std::string::npos, "32-hex token redacted");
+  check(out.find("[REDACTED_HEX32]") != std::string::npos,
+        "hex32 marker present");
+}
+
+static void test_sanitize_mongo_id() {
+  onvif::DumpSanitizer s;
+  const std::string id = "0011223344556677889900aa";  // 24 hex, lowercase
+  const std::string out = s.sanitize(
+      "\"cameraId\": \"" + id + "\", other=1");
+  check(out.find(id) == std::string::npos, "24-hex Mongo id redacted");
+  check(out.find("id-") != std::string::npos,
+        "Mongo id replaced with id-<hash> label");
+  // Same input -> same label within one sanitiser (idempotence proxy).
+  const std::string out2 = s.sanitize("ref " + id + " done");
+  const auto pos = out2.find("id-");
+  check(pos != std::string::npos && pos + 11 <= out2.size(),
+        "same Mongo id gets same 8-hex suffix on repeat encounter");
+}
+
+static void test_sanitize_mac_colon() {
+  onvif::DumpSanitizer s;
+  const std::string mac = "A1:B2:C3:D4:E5:F6";
+  const std::string out = s.sanitize("client=" + mac + " done");
+  check(out.find(mac) == std::string::npos,
+        "colon-form MAC redacted");
+  check(out.find("mac-") != std::string::npos,
+        "MAC replaced with mac-<hash> label");
+}
+
+static void test_sanitize_mac_bare() {
+  onvif::DumpSanitizer s;
+  const std::string mac = "A1B2C3D4E5F6";
+  const std::string in =
+      "[T:" + mac + "] decode; "
+      "/srv/unifi-protect/video/2026/06/26/" + mac + "_0_rotating_1.ubv";
+  const std::string out = s.sanitize(in);
+  check(out.find(mac) == std::string::npos,
+        "bare 12-hex MAC redacted in both bracket + path forms");
+  // Both occurrences map to the same label (deterministic).
+  const size_t first = out.find("mac-");
+  const size_t second = out.find("mac-", first + 1);
+  check(first != std::string::npos && second != std::string::npos,
+        "MAC appears twice; each replaced");
+  check(out.substr(first, 12) == out.substr(second, 12),
+        "same MAC -> same label on both occurrences");
+}
+
+static void test_mongo_id_before_mac_bare() {
+  // A lowercase 24-hex Mongo id contains a lowercase 12-hex prefix.
+  // The 24-hex rule must run BEFORE the 12-hex MAC rule so we don't
+  // chew off the first 12 chars of a Mongo id into a spurious "mac-"
+  // label.
+  onvif::DumpSanitizer s;
+  const std::string id = "aabbccddeeffaabbccddeeff";  // 24 lowercase hex
+  const std::string out = s.sanitize("[" + id + "]");
+  // If ordering were wrong, we'd see "mac-<x>ccddeeff" left behind.
+  // Correct: the whole 24-hex ID becomes id-<hash>, no mac- label.
+  check(out.find("mac-") == std::string::npos,
+        "24-hex ID not chewed by MAC-bare rule");
+  check(out.find("id-") != std::string::npos,
+        "24-hex ID redacted as id-<hash>");
+}
+
+static void test_sanitize_ignores_short_hex_and_versions() {
+  // Regression: hex-shaped tokens shorter than 12 chars, and dotted
+  // version strings, must NOT be redacted.
+  onvif::DumpSanitizer s;
+  const std::string out = s.sanitize(
+      "commit abc123def; v7.1.83; err 0xdeadbeef");
+  check(out.find("abc123def") != std::string::npos,
+        "short hex (9 chars) untouched");
+  check(out.find("v7.1.83") != std::string::npos,
+        "semver preserved");
+  check(out.find("0xdeadbeef") != std::string::npos,
+        "8-hex pointer untouched");
+}
+
 int main() {
   test_ip_remap_basic();
   test_ip_remap_consistent();
@@ -262,6 +409,16 @@ int main() {
   test_sanitize_camera_names();
   test_sanitize_camera_name_longest_first();
   test_sanitize_camera_name_deterministic();
+  test_sanitize_sentry_dsn();
+  test_sanitize_query_session_values();
+  test_sanitize_ws_path_token();
+  test_sanitize_uuid();
+  test_sanitize_hex32_token();
+  test_sanitize_mongo_id();
+  test_sanitize_mac_colon();
+  test_sanitize_mac_bare();
+  test_mongo_id_before_mac_bare();
+  test_sanitize_ignores_short_hex_and_versions();
 
   std::cout << "test_dump_sanitizer: " << g_pass << " passed, "
             << g_fail << " failed\n";
