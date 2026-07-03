@@ -293,6 +293,22 @@ static void test_sanitize_ws_path_token() {
         "host + port preserved");
 }
 
+// Regression for the gleep52-dump gap on issue #34: 17 raw 16-char play
+// tokens leaked because the streaming-path rule only matched wss?://.
+// Protect's api.log also carries tcp:// livestream redirects.
+static void test_sanitize_tcp_path_token() {
+  onvif::DumpSanitizer s;
+  const std::string tok = "AbCdEf1234567890";  // 16 chars, synthetic
+  const std::string out = s.sanitize(
+      "livestream response {\"url\":\"tcp://host:7451/" + tok + "\"}");
+  check(out.find(tok) == std::string::npos,
+        "tcp path token redacted");
+  check(out.find("[REDACTED_WS_TOKEN]") != std::string::npos,
+        "tcp token marker present");
+  check(out.find("tcp://host:7451/") != std::string::npos,
+        "host + port preserved for tcp scheme");
+}
+
 static void test_sanitize_uuid() {
   onvif::DumpSanitizer s;
   const std::string uuid = "0123abcd-4567-89ab-cdef-0123456789ab";
@@ -412,6 +428,7 @@ int main() {
   test_sanitize_sentry_dsn();
   test_sanitize_query_session_values();
   test_sanitize_ws_path_token();
+  test_sanitize_tcp_path_token();
   test_sanitize_uuid();
   test_sanitize_hex32_token();
   test_sanitize_mongo_id();

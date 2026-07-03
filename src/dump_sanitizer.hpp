@@ -42,8 +42,9 @@ namespace onvif {
 //     rules run so nothing partial leaks.
 //   - Query-string session correlators (?uniqid=, requestId=,
 //     sessionId=) get their values blanked.
-//   - WebSocket path tokens (wss://host/<12+ base62 chars>) get the
-//     token portion replaced with [REDACTED_WS_TOKEN].
+//   - Streaming path tokens (wss://host/<12+ base62 chars> and
+//     tcp://host:port/<12+ base62 chars>) get the token portion
+//     replaced with [REDACTED_WS_TOKEN].
 //   - UUIDs (36-char 8-4-4-4-12 form), 24-hex Mongo-style IDs, and
 //     bare or colon-form MAC addresses are replaced with stable
 //     FNV-1a hash labels (uuid-<8hex> / id-<8hex> / mac-<8hex>) so

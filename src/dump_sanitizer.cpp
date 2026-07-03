@@ -221,14 +221,17 @@ std::string DumpSanitizer::sanitize(const std::string& in) {
       std::regex::icase);
   out = std::regex_replace(out, session_qs_re, "$1=[REDACTED]");
 
-  // -------- WebSocket path tokens ---------
-  // wss://host/<12+ base62 chars>?... appears in livestream redirect URLs
-  // in Protect's api.log.  The path token is a session-scoped play secret
-  // that shouldn't leave the install.
-  static const std::regex ws_path_re(
-      R"((wss?://[^/\s"'<>]+/)([A-Za-z0-9]{12,}))",
+  // -------- Streaming path tokens ---------
+  // wss://host/<12+ base62 chars>?... and tcp://host:port/<12+ base62 chars>
+  // both appear in livestream redirect URLs in Protect's api.log.  The
+  // path token is a session-scoped play secret that shouldn't leave the
+  // install.  Field-observed: gleep52's dump on issue #34 carried 17 raw
+  // tcp:// tokens because the earlier version of this rule only matched
+  // wss?://.
+  static const std::regex stream_path_re(
+      R"(((?:wss?|tcp)://[^/\s"'<>]+/)([A-Za-z0-9]{12,}))",
       std::regex::icase);
-  out = std::regex_replace(out, ws_path_re, "$1[REDACTED_WS_TOKEN]");
+  out = std::regex_replace(out, stream_path_re, "$1[REDACTED_WS_TOKEN]");
 
   // -------- UUIDs (36-char with dashes) ---------
   // 8-4-4-4-12 hex.  Ironclad accessId, sessionId payload values, Protect
