@@ -599,10 +599,56 @@ static void test_hot_add(const std::string& jsonl) {
   CHECK(ok, "hot-added camera did not produce events");
 }
 
+// -------------------------------------------------------------
+// PullPoint exponential backoff schedule.  The static
+// next_backoff_ms() is the pure function used by CameraWorker
+// when the camera keeps returning empty PullMessagesResponse in
+// < 4 s; testing it independently means we don't need an
+// emulator that can misbehave to verify the schedule.
+// -------------------------------------------------------------
+static void test_backoff_schedule() {
+  using L = onvif::OnvifListener;
+
+  // First step out of idle floors at 2 s.
+  CHECK(L::next_backoff_ms(0) == 2000, "backoff step 0 -> 2s");
+
+  // Doubles from the floor: 2 -> 4 -> 8 -> 16 -> 32 -> 64 -> ...
+  uint64_t prev = 2000;
+  const uint64_t expected[] = {
+    4000, 8000, 16000, 32000, 64000, 128000,
+    256000, 512000, 1024000, 2048000,
+  };
+  for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); ++i) {
+    const uint64_t got = L::next_backoff_ms(prev);
+    CHECK(got == expected[i],
+          std::string("schedule step doubles from ") +
+              std::to_string(prev) + "ms to " + std::to_string(expected[i]) +
+              "ms; got " + std::to_string(got));
+    prev = got;
+  }
+
+  // From 2048 s, doubling would land at 4096 s -- must cap at 3600 s.
+  CHECK(L::next_backoff_ms(2048000) == 3600000,
+        "backoff caps at 3600s (1 hour)");
+  // Once at the cap, stays at the cap on further advances.
+  CHECK(L::next_backoff_ms(3600000) == 3600000,
+        "backoff stays at the 3600s cap");
+  // Well above the cap (defensive) collapses to the cap too.
+  CHECK(L::next_backoff_ms(999999999) == 3600000,
+        "backoff never exceeds the cap");
+}
+
 // ============================================================
 // main
 // ============================================================
 int main(int argc, char* argv[]) {
+  // Test emulators return empty PullMessagesResponse instantly, which
+  // is exactly the fingerprint that backoff exists to defend against.
+  // Real cameras honor the PT5S long-poll and never engage backoff;
+  // disable it here so emulator tests aren't slowed to the schedule
+  // ceiling.  Verified independently by test_backoff_schedule().
+  onvif::OnvifListener::disable_pull_backoff_for_test();
+
   if (argc < 17) {
     std::cerr << "Usage: " << argv[0] << "\n"
               << "  <hikvision_compatible.jsonl>\n"
@@ -678,6 +724,8 @@ int main(int argc, char* argv[]) {
            [&] { test_both_cameras(hikvision_jsonl, dahua_jsonl); });
   run_test("axis_ref_params",
            [] { test_axis_ref_params(); });
+  run_test("backoff_schedule",
+           [] { test_backoff_schedule(); });
 
   onvif::global_cleanup();
 

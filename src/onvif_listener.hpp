@@ -158,6 +158,26 @@ void global_cleanup();
 //   }
 //   onvif::global_cleanup();
 // ---------------------------------------------------------------
+// Diagnostic snapshot for one camera, published by CameraWorker after each
+// pull tick and mirrored to the admin UI via /api/camera_health.  Fields
+// here are additive-only -- callers deserialise by name, so appending new
+// members is a compatible change.
+struct CameraHealth {
+  std::string ip;
+  uint64_t events_received_total{0};
+  uint64_t last_event_ms{0};       // 0 = never
+  uint64_t last_renew_ms{0};       // 0 = never
+  uint64_t subscribed_at_ms{0};    // 0 = not subscribed
+  bool     subscribed{false};
+  // Exponential backoff engaged when the camera keeps returning empty
+  // PullMessagesResponse in < 4 s (ignoring our PT5S long-poll request).
+  // Interpreted as the camera rate-limiting us to avoid DoS.  Schedule:
+  // 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 3600 seconds (capped).
+  // Reset to 0 by any pull that yielded events or naturally took >= 4 s.
+  uint64_t pull_backoff_sec{0};       // 0 = normal cadence
+  uint64_t pull_backoff_since_ms{0};  // 0 = not in backoff
+};
+
 class OnvifListener {
  public:
     OnvifListener();
@@ -195,6 +215,25 @@ class OnvifListener {
     /// or the shutdown deadline has been reached.
     void stop();
 
+    /// Snapshot of per-camera health from the most recent publish tick
+    /// of each CameraWorker.  Safe to call concurrently with run() from
+    /// any thread (typically the admin-server HTTP handler thread).
+    std::vector<CameraHealth> healths() const;
+
+    /// Compute the next backoff-sleep value given the current one.
+    /// Extracted as a static helper so it is unit-testable without
+    /// standing up an emulator camera.  Schedule: 0 -> 2 s -> 4 s ->
+    /// 8 s -> ... -> 3600 s cap.  Public for tests only.
+    static uint64_t next_backoff_ms(uint64_t current_ms);
+
+    /// Test escape hatch: disable PullPoint backoff process-wide.  The
+    /// emulator cameras used by test_onvif_listener return empty
+    /// PullMessagesResponse instantly (the exact fingerprint backoff
+    /// exists to defend against), which would otherwise make the tests
+    /// hang for minutes at a time.  Real cameras honor the PT5S
+    /// long-poll and never hit this path.
+    static void disable_pull_backoff_for_test();
+
  private:
     std::atomic<bool>         running_{false};
     std::vector<CameraConfig> cameras_;
@@ -203,6 +242,16 @@ class OnvifListener {
     // Drained by run()'s supervisor loop under pending_mutex_.
     absl::Mutex               pending_mutex_;
     std::vector<CameraConfig> pending_cameras_;
+
+    // Published by every CameraWorker after each pull tick.  Read by
+    // healths() from arbitrary threads.  Keyed by camera IP so a hot-added
+    // camera slots in without disturbing the others.
+    mutable absl::Mutex       healths_mutex_;
+    std::map<std::string, CameraHealth>
+                              healths_ ABSL_GUARDED_BY(healths_mutex_);
+
+    // Called by CameraWorker to push its latest snapshot into healths_.
+    void publish_health(const CameraHealth& h);
 };
 
 }  // namespace onvif

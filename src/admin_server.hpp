@@ -15,8 +15,11 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
+#include <vector>
 
+#include "onvif_listener.hpp"
 #include "unifi_camera_config.hpp"
 
 struct MHD_Daemon;
@@ -44,6 +47,9 @@ class AdminServer {
   /// @p version is the version string reported by /api/status.
   /// Pass @p port == 0 to let the OS pick an ephemeral port (tests);
   /// the chosen port is then available via port().
+  using GetOnvifHealthsFn =
+      std::function<std::vector<onvif::CameraHealth>()>;
+
   bool start(const std::string& version,
              const std::string& channel_file,
              uint16_t port = 7891,
@@ -51,7 +57,8 @@ class AdminServer {
              const unifi::DbConfig& db = unifi::DbConfig{},
              const std::string& protect_url = "",
              ProtectUserIdProvider* protect_user_id_provider = nullptr,
-             const std::string& event_log_path = "");
+             const std::string& event_log_path = "",
+             GetOnvifHealthsFn get_onvif_healths = {});
 
   /// Return the port the server is listening on. Only meaningful after a
   /// successful start().  Useful when start() was called with port=0.
@@ -75,6 +82,7 @@ class AdminServer {
   std::string protect_url_;
   ProtectUserIdProvider* protect_user_id_provider_{nullptr};
   std::string event_log_path_;
+  GetOnvifHealthsFn get_onvif_healths_;
   uint16_t port_{0};
 };
 

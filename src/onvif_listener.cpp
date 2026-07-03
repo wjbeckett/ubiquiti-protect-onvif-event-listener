@@ -34,6 +34,7 @@
 #include <cstring>
 #include <ctime>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <map>
@@ -55,6 +56,14 @@
 #include "util.hpp"
 
 namespace onvif {
+
+// Process-wide test escape hatch.  Emulators used by the test suite
+// return empty PullMessagesResponse instantly; without disabling backoff
+// they would hang each emulator test at the schedule ceiling.  Real
+// cameras honor the PT5S long-poll and never hit this path.  Declared
+// at namespace scope (not inside OnvifListener) so CameraWorker can
+// consult it without threading the flag through the constructor.
+static std::atomic<bool> g_pull_backoff_disabled_for_test{false};
 
 // ============================================================
 // Library lifecycle
@@ -426,10 +435,14 @@ struct Notification {
 // -------------------------------------------------------
 class CameraWorker {
  public:
+  using PublishHealthFn = std::function<void(const CameraHealth&)>;
+
   CameraWorker(const CameraConfig& cfg,
                const EventCallback& cb,
-               const std::atomic<bool>& running)
-    : cfg_(cfg), cb_(cb), running_(running) {}
+               const std::atomic<bool>& running,
+               PublishHealthFn publish_health = {})
+    : publish_health_(std::move(publish_health)),
+      cfg_(cfg), cb_(cb), running_(running) {}
 
   void run() {
     LOG(INFO) << '[' << cfg_.ip << "] started";
@@ -528,7 +541,58 @@ class CameraWorker {
           heartbeat_at = std::chrono::steady_clock::now()
                        + std::chrono::seconds(60);
         }
+        // If we've engaged backoff (camera has been returning empty
+        // PullMessagesResponse in < 4 s), wait before firing the next
+        // pull.  Renew and heartbeat above still fire on schedule so a
+        // long backoff doesn't drop the subscription.
+        const bool backoff_enabled =
+            !g_pull_backoff_disabled_for_test.load(
+                std::memory_order_relaxed);
+        const uint64_t backoff_ms = pull_backoff_ms_.load();
+        if (backoff_enabled && backoff_ms > 0)
+          sleep_interruptible_ms(backoff_ms);
+        if (!running_) break;
+        const uint64_t events_before = events_received_total_.load();
+        auto pull_started = std::chrono::steady_clock::now();
         absl::Status ps = pull(sub.url, sub.ref_params, sv.alarm_url);
+        auto pull_dur = std::chrono::steady_clock::now() - pull_started;
+        const bool got_events =
+            events_received_total_.load() > events_before;
+        // A well-behaved camera holds our PT5S long-poll open for
+        // ~5 s; use 4 s as the "camera honored the timeout" threshold.
+        constexpr auto kHonoredTimeout = std::chrono::milliseconds(4000);
+        if (ps.ok() && backoff_enabled) {
+          if (got_events || pull_dur >= kHonoredTimeout) {
+            // Reset backoff.  Log if we were in it so the transition is
+            // visible in the journal / diagnostic dump.
+            const uint64_t was = pull_backoff_ms_.exchange(0);
+            pull_backoff_since_ms_.store(0);
+            if (was > 0) {
+              LOG(INFO) << '[' << cfg_.ip
+                        << "] backoff reset -> resuming normal poll cadence"
+                        << " (was " << (was / 1000) << "s, "
+                        << (got_events ? "events received"
+                                       : "camera honored PT5S timeout")
+                        << ")";
+            }
+          } else {
+            // Fast empty response -- advance the backoff.
+            const uint64_t old_ms = pull_backoff_ms_.load();
+            const uint64_t new_ms = OnvifListener::next_backoff_ms(old_ms);
+            pull_backoff_ms_.store(new_ms);
+            if (old_ms == 0)
+              pull_backoff_since_ms_.store(util::now_ms());
+            LOG_EVERY_N(INFO, 4)
+                << '[' << cfg_.ip << "] backoff -> " << (new_ms / 1000)
+                << "s (camera returned empty in "
+                << std::chrono::duration_cast<std::chrono::milliseconds>(
+                       pull_dur).count()
+                << "ms, ignoring PT5S long-poll -- likely rate-limiting)";
+          }
+        }
+        // Publish health after every pull tick so the admin UI sees
+        // backoff changes on its next refresh.
+        publish_current_health();
         if (!ps.ok()) {
           if (consecutive_failures == 0)
             streak_start = std::chrono::steady_clock::now();
@@ -565,23 +629,16 @@ class CameraWorker {
 
   bool finished() const { return finished_.load(); }
 
-  // Diagnostic snapshot used by /api/camera_health.
-  struct Health {
-    std::string ip;
-    uint64_t events_received_total{0};
-    uint64_t last_event_ms{0};       // 0 = never
-    uint64_t last_renew_ms{0};       // 0 = never
-    uint64_t subscribed_at_ms{0};    // 0 = not subscribed
-    bool     subscribed{false};
-  };
-  Health health() const {
-    Health h;
+  CameraHealth health() const {
+    CameraHealth h;
     h.ip                    = cfg_.ip;
     h.events_received_total = events_received_total_.load();
     h.last_event_ms         = last_event_ms_.load();
     h.last_renew_ms         = last_renew_ms_.load();
     h.subscribed_at_ms      = subscribed_at_ms_.load();
     h.subscribed            = subscribed_at_ms_.load() != 0;
+    h.pull_backoff_sec      = pull_backoff_ms_.load() / 1000;
+    h.pull_backoff_since_ms = pull_backoff_since_ms_.load();
     return h;
   }
 
@@ -591,10 +648,29 @@ class CameraWorker {
   std::atomic<uint64_t> last_event_ms_{0};
   std::atomic<uint64_t> last_renew_ms_{0};
   std::atomic<uint64_t> subscribed_at_ms_{0};
+  // Current sleep interval before the next PullMessages call.  0 = no
+  // backoff.  Written by the pull loop after each tick; read by health().
+  std::atomic<uint64_t> pull_backoff_ms_{0};
+  std::atomic<uint64_t> pull_backoff_since_ms_{0};
+  PublishHealthFn       publish_health_;
+
+  void publish_current_health() {
+    if (publish_health_) publish_health_(health());
+  }
 
   void sleep_interruptible(int secs) {
     for (int i = 0; i < secs && running_; ++i)
       std::this_thread::sleep_for(std::chrono::seconds(1));
+  }
+  // Sleep for @p ms milliseconds in 250 ms slices so a stop() during a
+  // long backoff returns promptly.
+  void sleep_interruptible_ms(uint64_t ms) {
+    constexpr uint64_t kSliceMs = 250;
+    for (uint64_t elapsed = 0; elapsed < ms && running_; elapsed += kSliceMs) {
+      const uint64_t remaining = ms - elapsed;
+      const uint64_t slice = remaining < kSliceMs ? remaining : kSliceMs;
+      std::this_thread::sleep_for(std::chrono::milliseconds(slice));
+    }
   }
 
   // Log msg, sleep for the remainder of the failure window, then reset *failures.
@@ -967,7 +1043,8 @@ void OnvifListener::run(EventCallback cb) {
   workers.reserve(cameras_.size());
   for (const auto& cam : cameras_)
     workers.push_back(
-      std::make_unique<CameraWorker>(cam, cb, running_));
+      std::make_unique<CameraWorker>(cam, cb, running_,
+          [this](const CameraHealth& h){ this->publish_health(h); }));
 
   // Launch one thread per camera
   std::vector<std::thread> threads;
@@ -994,7 +1071,8 @@ void OnvifListener::run(EventCallback cb) {
       for (auto& cfg : hot_adds) {
         cameras_.push_back(cfg);
         workers.push_back(
-            std::make_unique<CameraWorker>(cfg, cb, running_));
+            std::make_unique<CameraWorker>(cfg, cb, running_,
+                [this](const CameraHealth& h){ this->publish_health(h); }));
         CameraWorker* ptr = workers.back().get();
         threads.emplace_back([ptr] { ptr->run(); });
       }
@@ -1185,6 +1263,40 @@ size_t RawSink::entry_count() const {
 size_t RawSink::compressed_bytes() const {
   absl::MutexLock lk(&mu_);
   return ring_bytes_;
+}
+
+// ---------------------------------------------------------------
+// OnvifListener: backoff schedule + per-camera health surface
+// ---------------------------------------------------------------
+
+void OnvifListener::disable_pull_backoff_for_test() {
+  g_pull_backoff_disabled_for_test.store(true, std::memory_order_relaxed);
+}
+
+// Schedule: 0 -> 2 s -> 4 s -> 8 s -> ... -> 3600 s (cap = 1 hour).
+// Rationale: doubling from a 2 s floor reaches 2048 s in 11 steps and
+// caps at 3600 s.  The camera might be perfectly healthy and simply
+// rate-limiting us to avoid DoS; when it starts returning events (or
+// starts honoring our PT5S long-poll again), the caller resets to 0.
+uint64_t OnvifListener::next_backoff_ms(uint64_t current_ms) {
+  constexpr uint64_t kMinMs = 2000;
+  constexpr uint64_t kMaxMs = 3600000;
+  if (current_ms == 0) return kMinMs;
+  const uint64_t doubled = current_ms * 2;
+  return doubled >= kMaxMs ? kMaxMs : doubled;
+}
+
+void OnvifListener::publish_health(const CameraHealth& h) {
+  absl::MutexLock lock(&healths_mutex_);
+  healths_[h.ip] = h;
+}
+
+std::vector<CameraHealth> OnvifListener::healths() const {
+  absl::MutexLock lock(&healths_mutex_);
+  std::vector<CameraHealth> out;
+  out.reserve(healths_.size());
+  for (const auto& [ip, h] : healths_) out.push_back(h);
+  return out;
 }
 
 }  // namespace onvif

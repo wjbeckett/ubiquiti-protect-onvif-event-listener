@@ -32,6 +32,7 @@ typedef int MHD_Result;
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <sstream>
 #include <string>
@@ -102,6 +103,7 @@ border-radius:50%;animation:spin 1s linear infinite}
 font-weight:600;text-transform:uppercase;letter-spacing:.04em}
 .pill.green{background:#1a3a1a;color:#a0e0a0}
 .pill.amber{background:#3a2a1a;color:#e0c290}
+.pill.yellow{background:#3a3020;color:#e6d38a}
 .pill.red{background:#3a1a1a;color:#e0a0a0}
 .pill.grey{background:#2a3140;color:#9aa0a6}
 </style></head><body>
@@ -417,6 +419,11 @@ function pillFor(ageMs){
   if (m < 360)  return '<span class="pill amber">stale</span>';
   return '<span class="pill red">silent</span>';
 }
+function fmtBackoff(sec){
+  if (sec < 60)      return sec + 's';
+  if (sec < 3600)    return Math.floor(sec/60) + 'm';
+  return Math.floor(sec/3600) + 'h';
+}
 async function loadCameraHealth(){
   try {
     const r = captureCsrf(await fetch('api/camera_health'));
@@ -438,6 +445,13 @@ async function loadCameraHealth(){
                    target="_blank" rel="noopener" style="color:#f0c674">issue #20</a> for the fix.
            </td></tr>`
         : '';
+      // ONVIF PullPoint backoff: engaged when the camera keeps returning
+      // empty PullMessagesResponse in < 4 s, ignoring our PT5S long-poll
+      // request.  Interpreted as the camera rate-limiting us to avoid
+      // DoS, so we back off exponentially up to 1 hour.
+      const backoffPill = (c.pull_backoff_sec && c.pull_backoff_sec > 0)
+        ? ` <span class="pill yellow" title="Camera returns empty pulls instantly instead of honoring our 5s long-poll; backed off to protect it from over-polling. Resets automatically on the next event or long-poll response.">backoff ${fmtBackoff(c.pull_backoff_sec)}</span>`
+        : '';
       return `<tr>
         <td style="padding:4px 6px">${c.name || '(unnamed)'}</td>
         <td style="padding:4px 6px;color:#9aa0a6">${c.host || '-'}</td>
@@ -446,7 +460,7 @@ async function loadCameraHealth(){
         <td style="padding:4px 6px">${c.events_1h}</td>
         <td style="padding:4px 6px">${c.hint === 'needs_onvif_admin'
             ? '<span class="pill red">auth</span>'
-            : pillFor(age)}</td>
+            : pillFor(age)}${backoffPill}</td>
       </tr>${hintRow}`;
     }).join('');
   } catch (e) {
@@ -691,6 +705,10 @@ struct Ctx {
   // pending requests so the pointer remains valid.
   onvif::ProtectUserIdProvider* protect_user_id_provider;
   const char* event_log_path;     // value of --event_log; empty if disabled
+  // Snapshot of per-camera health from the ONVIF listener.  Optional --
+  // when unset (e.g. dev-server or tests) camera_health.json omits the
+  // pull_backoff_sec field.  Callable from any thread.
+  std::function<std::vector<onvif::CameraHealth>()> get_onvif_healths;
 };
 
 // Build a JSON response body for GET /api/status.
@@ -944,6 +962,16 @@ std::string build_camera_health_json(const Ctx& ctx) {
     j += "]}";
     return j;
   }
+  // Merge in per-IP backoff state from the ONVIF listener.  Look up is
+  // by camera IP (== CameraHealth::ip) because the DB rows and the
+  // listener don't share an id.
+  std::map<std::string, onvif::CameraHealth> health_by_ip;
+  if (ctx.get_onvif_healths) {
+    for (auto& h : ctx.get_onvif_healths()) {
+      const std::string ip = h.ip;
+      health_by_ip[ip] = std::move(h);
+    }
+  }
   bool first = true;
   for (const auto& r : *rows_or) {
     if (!first) j += ',';
@@ -958,6 +986,13 @@ std::string build_camera_health_json(const Ctx& ctx) {
     j += std::to_string(r.last_event_ms);
     j += ",\"events_1h\":";
     j += std::to_string(r.events_1h);
+    auto hit = health_by_ip.find(r.host);
+    if (hit != health_by_ip.end() && hit->second.pull_backoff_sec > 0) {
+      j += ",\"pull_backoff_sec\":";
+      j += std::to_string(hit->second.pull_backoff_sec);
+      j += ",\"pull_backoff_since_ms\":";
+      j += std::to_string(hit->second.pull_backoff_since_ms);
+    }
     if (camera_needs_onvif_admin(r.host)) {
       j += ",\"hint\":\"needs_onvif_admin\"";
     }
@@ -1447,7 +1482,8 @@ bool AdminServer::start(const std::string& version,
                         const unifi::DbConfig& db,
                         const std::string& protect_url,
                         onvif::ProtectUserIdProvider* protect_user_id_provider,
-                        const std::string& event_log_path) {
+                        const std::string& event_log_path,
+                        GetOnvifHealthsFn get_onvif_healths) {
   version_ = version;
   channel_file_ = channel_file;
   config_path_ = config_path;
@@ -1455,6 +1491,7 @@ bool AdminServer::start(const std::string& version,
   protect_url_ = protect_url;
   protect_user_id_provider_ = protect_user_id_provider;
   event_log_path_ = event_log_path;
+  get_onvif_healths_ = std::move(get_onvif_healths);
 
   struct sockaddr_in addr{};
   addr.sin_family = AF_INET;
@@ -1465,7 +1502,7 @@ bool AdminServer::start(const std::string& version,
   auto* ctx = new Ctx{version_.c_str(), channel_file_.c_str(),
                       config_path_.c_str(), &db_,
                       protect_url_.c_str(), protect_user_id_provider_,
-                      event_log_path_.c_str()};
+                      event_log_path_.c_str(), get_onvif_healths_};
 
   daemon_ = MHD_start_daemon(
       MHD_USE_INTERNAL_POLLING_THREAD,

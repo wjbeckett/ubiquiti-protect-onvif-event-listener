@@ -619,7 +619,12 @@ int main(int argc, char* argv[]) {
                          kConfigPath, cam_db,
                          absl::GetFlag(FLAGS_protect_url),
                          &protect_user_id_provider,
-                         event_log)) {
+                         event_log,
+                         [] {
+                           return g_listener
+                             ? g_listener->healths()
+                             : std::vector<onvif::CameraHealth>{};
+                         })) {
     LOG(INFO) << "[admin_server] listening on 127.0.0.1:" << admin_port;
     auto ng_a = protect_ui::patch_nginx_admin_proxy(admin_port);
     if (!ng_a.ok())
