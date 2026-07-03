@@ -144,6 +144,26 @@ static void test_sanitize_url_creds() {
         "redacted creds form");
 }
 
+// RTSP stream URLs with embedded credentials appear in cameras.json
+// (via Protect's cameras.channels / sourceUrl columns).  The previous
+// URL-creds rule matched http(s) only; this test guards the extension.
+static void test_sanitize_rtsp_creds() {
+  onvif::DumpSanitizer s;
+  const std::string out = s.sanitize(
+      "\"rtspUrl\":\"rtsp://user:swordfish@10.0.0.5:554/stream1\"");
+  check(out.find("user:swordfish") == std::string::npos,
+        "rtsp creds redacted");
+  check(out.find("[REDACTED]:[REDACTED]@") != std::string::npos,
+        "rtsp redaction marker present");
+  // rtsps + rtmp forms also covered.
+  const std::string out2 = s.sanitize(
+      "rtsps://admin:secret@host/x rtmp://user:pw@host/live");
+  check(out2.find("admin:secret") == std::string::npos,
+        "rtsps creds redacted");
+  check(out2.find("user:pw") == std::string::npos,
+        "rtmp creds redacted");
+}
+
 static void test_sanitize_basic_auth_header() {
   onvif::DumpSanitizer s;
   const std::string out = s.sanitize(
@@ -418,6 +438,7 @@ int main() {
   test_sanitize_wsse_tags();
   test_sanitize_kv_passwords();
   test_sanitize_url_creds();
+  test_sanitize_rtsp_creds();
   test_sanitize_basic_auth_header();
   test_sanitize_xuserid();
   test_sanitize_user_kv();

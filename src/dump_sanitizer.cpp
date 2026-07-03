@@ -194,8 +194,12 @@ std::string DumpSanitizer::sanitize(const std::string& in) {
   out = std::regex_replace(out, user_kv_re, "$1[REDACTED]");
 
   // -------- URL credentials: scheme://user:pass@host --------
+  // Handles http(s), rtsp(s), and rtmp URLs.  Third-party cameras store
+  // their RTSP stream URL in Protect's cameras.channels / .sourceUrl
+  // with credentials embedded (rtsp://user:pass@host:port/stream), and
+  // those columns show up in cameras.json.
   static const std::regex url_creds_re(
-      R"((https?://)([^:/@\s]+):([^@\s]+)@)",
+      R"(((?:https?|rtsps?|rtmp)://)([^:/@\s]+):([^@\s]+)@)",
       std::regex::icase);
   out = std::regex_replace(out, url_creds_re,
       "$1[REDACTED]:[REDACTED]@");

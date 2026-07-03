@@ -17,6 +17,7 @@
 #include <arpa/inet.h>
 #include <curl/curl.h>
 #include <gperftools/malloc_extension.h>
+#include <libpq-fe.h>
 #include <microhttpd.h>
 #include <netinet/in.h>
 
@@ -27,6 +28,7 @@ typedef int MHD_Result;
 #include <signal.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>  // NOLINT(build/c++11)
 #include <cstdio>
 #include <cstdlib>
@@ -34,6 +36,7 @@ typedef int MHD_Result;
 #include <fstream>
 #include <functional>
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -1123,6 +1126,263 @@ std::pair<int, std::string> handle_config(const Ctx& ctx,
 //                        issues invisible to userspace: SATA link resets,
 //                        OOM kills, filesystem errors, USB hot-unplug, etc.
 //   - system.txt         uname -a, /sys/firmware/devicetree/base/model, free, df
+// Full row dump from the Protect `cameras` table, keyed by the columns
+// that matter for triage.  Uses jsonb minus the large opaque-blob
+// columns to keep file size sane and let a triager `jq` through it
+// without hunting through hundreds of KB per row.  Sanitiser handles
+// the interesting bits inside the JSON:
+//   * mac / id / channels.<any>.mac -> mac-<hash> / id-<hash>
+//   * embedded RTSP URLs with creds -> [REDACTED]:[REDACTED]@ (see
+//     the url_creds rule extension for rtsps? / rtmp schemes).
+//   * host IPs -> per-prefix remap.
+//   * camera names -> Camera-<hash> (registered at dump start).
+std::string build_cameras_json(const Ctx& ctx) {
+  if (ctx.db == nullptr) return "[]";
+  const std::string conn_str = unifi::internal::build_connstr(*ctx.db);
+  PGconn* c = PQconnectdb(conn_str.c_str());
+  if (PQstatus(c) != CONNECTION_OK) {
+    PQfinish(c);
+    return "[]";
+  }
+  // Strip the largest opaque-blob columns to keep the output triage-
+  // friendly.  A missing column produces NULL in the row jsonb (the
+  // `-` operator is a no-op on absent keys), so the query stays
+  // schema-tolerant across Protect versions.
+  static const char* kSql =
+      "SELECT COALESCE("
+      "  jsonb_agg(row_data ORDER BY tp DESC NULLS LAST, name)::text, "
+      "  '[]'"
+      ") FROM ("
+      "  SELECT to_jsonb(c) "
+      "         - 'ispSettings' - 'talkbackSettings' "
+      "         - 'smartDetectSettings' - 'smartDetectLines' "
+      "         - 'smartDetectZones' - 'audioSettings' "
+      "         - 'ledSettings' - 'osdSettings' - 'pirSettings' "
+      "         - 'ptzSettings' - 'speakerSettings' - 'lcdMessage' "
+      "         - 'featureFlags' - 'hdrMode' - 'videoMode' "
+      "         - 'homekitSettings' - 'recordingSettings' "
+      "         - 'wifiConnectionState' - 'stats' - 'timelapseSettings' "
+      "    AS row_data, "
+      "    \"isThirdPartyCamera\" AS tp, name "
+      "  FROM cameras c "
+      ") q";
+  PGresult* r = PQexec(c, kSql);
+  std::string out = "[]";
+  if (PQresultStatus(r) == PGRES_TUPLES_OK && PQntuples(r) > 0 &&
+      !PQgetisnull(r, 0, 0)) {
+    out = PQgetvalue(r, 0, 0);
+  }
+  PQclear(r);
+  PQfinish(c);
+  return out;
+}
+
+// Per-camera recordingFiles aggregate: 1 h count, 24 h count, all-time
+// count, and the min/max start/end timestamps.  Directly answers "is
+// Protect recording video for this camera?" without a triager having
+// to guess from event counts.
+std::string build_recording_files_json(const Ctx& ctx) {
+  if (ctx.db == nullptr) return "[]";
+  const std::string conn_str = unifi::internal::build_connstr(*ctx.db);
+  PGconn* c = PQconnectdb(conn_str.c_str());
+  if (PQstatus(c) != CONNECTION_OK) {
+    PQfinish(c);
+    return "[]";
+  }
+  static const char* kSql =
+      "SELECT COALESCE("
+      "  jsonb_agg(row_data ORDER BY cid)::text, '[]'"
+      ") FROM ("
+      "  SELECT \"cameraId\" AS cid, jsonb_build_object("
+      "    'cameraId', \"cameraId\", "
+      "    'count_1h', COUNT(*) FILTER (WHERE start > ("
+      "        extract(epoch from now())*1000 - 3600000)::bigint), "
+      "    'count_24h', COUNT(*) FILTER (WHERE start > ("
+      "        extract(epoch from now())*1000 - 86400000)::bigint), "
+      "    'count_total', COUNT(*), "
+      "    'min_start_ms', MIN(start), "
+      "    'max_end_ms', MAX(\"end\")"
+      "  ) AS row_data "
+      "  FROM \"recordingFiles\" "
+      "  GROUP BY \"cameraId\""
+      ") q";
+  PGresult* r = PQexec(c, kSql);
+  std::string out = "[]";
+  if (PQresultStatus(r) == PGRES_TUPLES_OK && PQntuples(r) > 0 &&
+      !PQgetisnull(r, 0, 0)) {
+    out = PQgetvalue(r, 0, 0);
+  }
+  PQclear(r);
+  PQfinish(c);
+  return out;
+}
+
+// Count occurrences of @p needle within @p haystack.  Simple linear
+// scan; the log files we scan are bounded to a few MB apiece.
+int count_occurrences(const std::string& haystack, const std::string& needle) {
+  if (needle.empty()) return 0;
+  int n = 0;
+  size_t pos = 0;
+  while ((pos = haystack.find(needle, pos)) != std::string::npos) {
+    ++n;
+    pos += needle.size();
+  }
+  return n;
+}
+
+// Read every 8-hex-char identifier of the form `<prefix>-XXXXXXXX` out
+// of @p text into @p out (deduped).  Used to enumerate the hashed
+// cameraIds / macs the sanitiser produced elsewhere in the dump.
+void collect_hashes(const std::string& text, const char* prefix,
+                     std::set<std::string>* out) {
+  const size_t plen = std::strlen(prefix);
+  size_t pos = 0;
+  while ((pos = text.find(prefix, pos)) != std::string::npos) {
+    size_t start = pos + plen;
+    if (start + 8 > text.size()) break;
+    bool all_hex = true;
+    for (size_t i = 0; i < 8; ++i) {
+      const char c = text[start + i];
+      if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+        all_hex = false;
+        break;
+      }
+    }
+    if (all_hex) out->insert(text.substr(pos, plen + 8));
+    pos = start;
+  }
+}
+
+// Cross-reference summary: for every hashed cameraId / MAC we found in
+// the dump, count occurrences of a small set of error-marker strings
+// across the already-sanitised captures.  Answers "which camera
+// dominates the error signal in this dump?" without a triager having
+// to open five log files and correlate by hand.
+//
+// Consumes files already written to @p dump_dir, so it MUST run after
+// the captures at the end of build_diagnostic_dump().
+std::string build_triage_json(const std::string& dump_dir) {
+  const auto read = [&dump_dir](const char* name) -> std::string {
+    std::ifstream f(dump_dir + "/" + name, std::ios::binary);
+    if (!f.is_open()) return {};
+    std::stringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+  };
+  const std::string api      = read("protect-api.log");
+  const std::string grpc     = read("protect-grpc-client.log");
+  const std::string addon    = read("protect-addon.log");
+  const std::string journal  = read("journal.log");
+  const std::string cameras  = read("cameras.json");
+  const std::string rec      = read("recording_files.json");
+
+  // Only enumerate hashed identifiers that appear in cameras.json.
+  // The 24-hex Mongo-ID + MAC redactions fire on every matching token
+  // in the dump -- notification IDs, session IDs, user IDs, etc. --
+  // so if we walked the union across all files we'd emit hundreds of
+  // zero-count rows for unrelated IDs.  cameras.json is the ground
+  // truth for "which id/mac is a camera on this device."
+  std::set<std::string> ids, macs;
+  collect_hashes(cameras, "id-",  &ids);
+  collect_hashes(cameras, "mac-", &macs);
+
+  // Per-id error counters.  We scan for the strings independently of
+  // the id so a triager can correlate: `snapshot_errors_total` is the
+  // whole log's count, `snapshot_errors_by_id[id]` is that id's line-
+  // co-occurrence count (grep -c 'Snapshot not available.*id').
+  auto count_lines_with_both = [](const std::string& haystack,
+                                   const std::string& needle,
+                                   const std::string& id) -> int {
+    int hits = 0;
+    size_t pos = 0;
+    while (true) {
+      size_t start = haystack.find_last_of('\n', pos);
+      start = (start == std::string::npos) ? 0 : start + 1;
+      size_t end = haystack.find('\n', pos);
+      if (end == std::string::npos) end = haystack.size();
+      const std::string line = haystack.substr(start, end - start);
+      if (line.find(needle) != std::string::npos &&
+          line.find(id)     != std::string::npos) {
+        ++hits;
+      }
+      if (end >= haystack.size()) break;
+      pos = end + 1;
+    }
+    return hits;
+  };
+
+  // Score every key, then emit sorted by total error weight desc so the
+  // culprit camera surfaces on the first row without scrolling.
+  struct Row {
+    std::string key;
+    bool is_mac{false};
+    int snap_err{0};
+    int lost_rec{0};
+    int list_frag{0};
+    int score() const { return snap_err + lost_rec + list_frag; }
+  };
+  std::vector<Row> rows;
+  rows.reserve(ids.size() + macs.size());
+  for (const auto& id : ids) {
+    Row r;
+    r.key       = id;
+    r.is_mac    = false;
+    r.snap_err  = count_lines_with_both(api,
+                    "Snapshot not available", id);
+    r.lost_rec  = count_lines_with_both(grpc,
+                    "Lost recording notification", id);
+    rows.push_back(std::move(r));
+  }
+  for (const auto& mac : macs) {
+    Row r;
+    r.key       = mac;
+    r.is_mac    = true;
+    r.snap_err  = count_lines_with_both(api,
+                    "Snapshot not available", mac);
+    r.lost_rec  = count_lines_with_both(grpc,
+                    "Lost recording notification", mac);
+    r.list_frag = count_lines_with_both(addon, "ListFragments", mac);
+    rows.push_back(std::move(r));
+  }
+  std::sort(rows.begin(), rows.end(),
+            [](const Row& a, const Row& b) {
+              if (a.score() != b.score()) return a.score() > b.score();
+              return a.key < b.key;  // stable-ish tiebreak
+            });
+
+  std::string j = "{\"per_camera\":[";
+  bool first = true;
+  for (const Row& r : rows) {
+    if (!first) j += ',';
+    first = false;
+    j += "{\"key\":\"";
+    j += r.key;
+    j += "\",\"kind\":\"";
+    j += r.is_mac ? "mac" : "id";
+    j += "\",\"snapshot_errors\":" + std::to_string(r.snap_err);
+    j += ",\"lost_recording_notifications\":"
+         + std::to_string(r.lost_rec);
+    if (r.is_mac) {
+      j += ",\"list_fragments_lines\":" + std::to_string(r.list_frag);
+    }
+    j += "}";
+  }
+  j += "],";
+  // Global totals -- handy top-of-file summary.
+  j += "\"totals\":{";
+  j += "\"snapshot_errors\":" +
+       std::to_string(count_occurrences(api, "Snapshot not available"));
+  j += ",\"lost_recording_notifications\":" +
+       std::to_string(count_occurrences(grpc,
+           "Lost recording notification"));
+  j += ",\"list_fragments_lines\":" +
+       std::to_string(count_occurrences(addon, "ListFragments"));
+  j += ",\"distinct_ids_seen\":"  + std::to_string(ids.size());
+  j += ",\"distinct_macs_seen\":" + std::to_string(macs.size());
+  j += "}}";
+  return j;
+}
+
 // Returns ok status when the tarball exists at out_path.
 absl::Status build_diagnostic_dump(const Ctx& ctx,
                                    const std::string& out_path) {
@@ -1169,6 +1429,13 @@ absl::Status build_diagnostic_dump(const Ctx& ctx,
         read_file(ctx.config_path ? ctx.config_path : ""));
   write("status.json", build_status_json(ctx));
   write("camera_health.json", build_camera_health_json(ctx));
+  // Per-camera Protect DB rows and recordingFiles aggregates.  Both are
+  // JSON blobs coming straight from Postgres via jsonb_agg / jsonb_
+  // build_object; the standard DumpSanitizer pipeline redacts embedded
+  // MACs, Mongo IDs, UUIDs, RTSP credentials, and remaps IPs before
+  // they land on disk.
+  write("cameras.json",         build_cameras_json(ctx));
+  write("recording_files.json", build_recording_files_json(ctx));
   // 12h window covers the typical "I noticed it broke this morning" report
   // without blowing past journald's default retention on UDM.
   capture("journal.log",
@@ -1210,6 +1477,12 @@ absl::Status build_diagnostic_dump(const Ctx& ctx,
   capture("mst.log",
           "tail -n 2000 /srv/ms/logs/mst.log 2>/dev/null "
           "|| echo '(mst.log not readable)'");
+  // Triage summary -- per-camera error counts across the sanitised
+  // captures above.  Must run AFTER those writes so it reads back the
+  // hashed identifiers.  Idempotent under sanitize(): the file only
+  // contains hashes already, so passing through the pipeline is a
+  // no-op.
+  write("triage.json", build_triage_json(dir));
   // Raw ONVIF SOAP exchange log — sourced from the always-on in-memory
   // ring (see RawSink in onvif_listener).  No flag required: the dump
   // always contains the most recent ~1000 exchanges (~8 MiB cap).
