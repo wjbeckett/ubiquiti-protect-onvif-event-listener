@@ -19,7 +19,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
+#include <chrono>  // NOLINT(build/c++11)
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -27,6 +29,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>  // NOLINT(build/c++11)
 #include <utility>
 #include <vector>
 
@@ -207,8 +210,34 @@ absl::Status RestoreFromBackup(PGconn* conn, const std::string& dump_path) {
   return absl::OkStatus();
 }
 
-absl::Status EnrichRestored(PGconn* conn, int image_width, int image_height) {
-  // Pull every event that needs any backfill work.  Three reasons we might
+// Pure batch-size adaptation.  Extracted so it is unit-testable
+// without a live PGconn.  Semantics:
+//   * elapsed_ms > target_ms and current > min_size -> shrink
+//     proportionally, clamped to min.
+//   * elapsed_ms < target_ms / 2 and current < max_size -> double, cap
+//     at max.
+//   * otherwise -> stay put (goldilocks zone).
+int next_batch_size(int current_size,
+                    int64_t elapsed_ms,
+                    int64_t target_ms,
+                    int min_size,
+                    int max_size) {
+  if (current_size < min_size) current_size = min_size;
+  if (current_size > max_size) current_size = max_size;
+  if (elapsed_ms <= 0 || target_ms <= 0) return current_size;
+  if (elapsed_ms > target_ms && current_size > min_size) {
+    const int shrunk = static_cast<int>(
+        static_cast<int64_t>(current_size) * target_ms / elapsed_ms);
+    return std::max<int>(min_size, shrunk);
+  }
+  if (elapsed_ms * 2 < target_ms && current_size < max_size) {
+    return std::min<int>(max_size, current_size * 2);
+  }
+  return current_size;
+}
+
+absl::Status EnrichRestored(PGconn* conn, EnrichOptions opts) {
+  // Pull events that need any backfill work.  Three reasons we might
   // need to touch an event:
   //   (a) metadata still has the legacy sparse shape (no detectedAreas) ->
   //       UPDATE it to the rich shape.
@@ -221,6 +250,17 @@ absl::Status EnrichRestored(PGconn* conn, int image_width, int image_height) {
   //       re-INSERT (ON CONFLICT DO NOTHING covers idempotency).
   // The metadata UPDATE is idempotent (rewrites the same canonical synth)
   // so running on case (b)/(c) events just does a no-op rewrite.
+  //
+  // Historically this ran as one monolithic SELECT + one giant per-event
+  // loop, which could exceed the per-connection statement_timeout on
+  // busy Protect clusters (field-observed on issue #34's gleep52 dump:
+  // both restart cycles logged "enrich failed: canceling statement due
+  // to user request").  Now: paginated with an adaptive LIMIT sized to
+  // stay near opts.target_batch_ms per batch, with a duty-cycle sleep
+  // between batches so we don't starve normal Protect DB writes.  The
+  // SELECT's WHERE clause naturally excludes rows we've already
+  // enriched, so no explicit cursor is needed -- each iteration just
+  // re-runs the query and picks up the next chunk of remaining work.
   const char* select_events =
       "SELECT e.id, e.\"cameraId\", e.type, "
       "       e.\"smartDetectTypes\"::text, "
@@ -241,19 +281,61 @@ absl::Status EnrichRestored(PGconn* conn, int image_width, int image_height) {
       "          WHERE sdo.id = dl.\"objectId\" "
       "        ) "
       "    ) "
-      "  )";
+      "  ) "
+      "ORDER BY e.start "
+      "LIMIT $1";
 
-  PGresult* r = onvif::pg::ExecWithTimeout(conn, -1, select_events);
-  if (PQresultStatus(r) != PGRES_TUPLES_OK) {
-    auto msg = std::string("[recovery] select events failed: ")
-             + PQerrorMessage(conn);
-    PQclear(r);
-    return absl::InternalError(msg);
-  }
-  const int n = PQntuples(r);
-  LOG(INFO) << "[recovery] enriching " << n << " events";
-  int enriched = 0;
-  for (int i = 0; i < n; ++i) {
+  // Adaptive sizing constants.  Start small enough that the very first
+  // SELECT stays comfortably inside the DB's per-connection timeout;
+  // the loop grows if batches are under-running.
+  constexpr int kMinBatch = 5;
+  constexpr int kMaxBatch = 500;
+  int batch_size = 25;
+  int batch_no = 0;
+  int total_enriched = 0;
+  const auto run_started = std::chrono::steady_clock::now();
+  const int image_width  = opts.image_width;
+  const int image_height = opts.image_height;
+
+  while (true) {
+    if (opts.cancelled &&
+        opts.cancelled->load(std::memory_order_relaxed)) {
+      LOG(INFO) << "[recovery] enrich cancelled after " << total_enriched
+                << " event(s) across " << batch_no << " batch(es)";
+      return absl::OkStatus();
+    }
+    ++batch_no;
+    const auto batch_start = std::chrono::steady_clock::now();
+
+    const std::string limit_str = std::to_string(batch_size);
+    const char* select_params[] = { limit_str.c_str() };
+    // Explicit per-query timeout: 3x the batch target gives generous
+    // headroom over expected duration but still fails fast if the DB
+    // is wedged.  Passing an explicit value here bypasses the pg_util
+    // 60 s default that killed the pre-batched version.
+    const int select_timeout_ms =
+        static_cast<int>(opts.target_batch_ms.count()) * 3;
+    PGresult* r = onvif::pg::ExecParamsWithTimeout(
+        conn, select_timeout_ms, select_events, 1,
+        nullptr, select_params, nullptr, nullptr, 0);
+    if (PQresultStatus(r) != PGRES_TUPLES_OK) {
+      auto msg = std::string("[recovery] select events failed: ")
+               + PQerrorMessage(conn);
+      PQclear(r);
+      return absl::InternalError(msg);
+    }
+    const int n = PQntuples(r);
+    if (n == 0) {
+      PQclear(r);
+      const auto elapsed_s =
+          std::chrono::duration_cast<std::chrono::seconds>(
+              std::chrono::steady_clock::now() - run_started).count();
+      LOG(INFO) << "[recovery] enrich complete: " << total_enriched
+                << " event(s) across " << batch_no << " batch(es) in "
+                << elapsed_s << "s";
+      return absl::OkStatus();
+    }
+    for (int i = 0; i < n; ++i) {
     enricher::EventInput ein;
     ein.event_id    = PQgetvalue(r, i, 0);
     ein.camera_id   = PQgetvalue(r, i, 1);
@@ -370,11 +452,57 @@ absl::Status EnrichRestored(PGconn* conn, int image_width, int image_height) {
           << "ON CONFLICT (id) DO NOTHING";
       RunSimple(conn, sql.str());
     }
-    ++enriched;
-  }
-  PQclear(r);
-  LOG(INFO) << "[recovery] enriched " << enriched << " events";
-  return absl::OkStatus();
+    }  // per-event loop
+    PQclear(r);
+    total_enriched += n;
+    const auto batch_dur = std::chrono::steady_clock::now() - batch_start;
+    const auto batch_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            batch_dur).count();
+    LOG(INFO) << "[recovery] batch " << batch_no << ": enriched " << n
+              << " event(s) in " << batch_ms << "ms (total "
+              << total_enriched << ")";
+
+    // Adapt batch size for the next iteration.  When shrinking, log the
+    // transition so a persistent slow DB is visible in the journal.
+    const int64_t target_ms = opts.target_batch_ms.count();
+    const int new_size =
+        next_batch_size(batch_size, batch_ms, target_ms,
+                        kMinBatch, kMaxBatch);
+    if (new_size < batch_size) {
+      LOG(INFO) << "[recovery] batch overran target ("
+                << batch_ms << "ms > " << target_ms
+                << "ms) -- shrinking " << batch_size << " -> " << new_size;
+    }
+    batch_size = new_size;
+
+    // Duty-cycle sleep: yield sleep_ratio * batch_ms of wall time to
+    // other DB work.  Sliced so shutdown interrupts within 250 ms.
+    if (opts.sleep_ratio > 0.0 && batch_ms > 0) {
+      const int64_t sleep_ms =
+          static_cast<int64_t>(batch_ms * opts.sleep_ratio);
+      for (int64_t elapsed_ms = 0;
+           elapsed_ms < sleep_ms;
+           elapsed_ms += 250) {
+        if (opts.cancelled &&
+            opts.cancelled->load(std::memory_order_relaxed)) {
+          return absl::OkStatus();
+        }
+        const int64_t slice =
+            std::min<int64_t>(250, sleep_ms - elapsed_ms);
+        std::this_thread::sleep_for(std::chrono::milliseconds(slice));
+      }
+    }
+  }  // batch loop
+}
+
+absl::Status EnrichRestored(PGconn* conn,
+                             int image_width,
+                             int image_height) {
+  EnrichOptions opts;
+  opts.image_width  = image_width;
+  opts.image_height = image_height;
+  return EnrichRestored(conn, opts);
 }
 
 absl::Status Run(PGconn* conn, const std::string& backups_dir) {

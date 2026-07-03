@@ -330,10 +330,16 @@ ABSL_FLAG(std::string, channel_file, "/etc/onvif-recorder/channel",
 // ============================================================
 static onvif::OnvifListener* g_listener = nullptr;
 static onvif::MotionPoller*  g_poller   = nullptr;
+// Flipped by signal_handler to signal an in-flight auto_recover
+// background thread that it should exit at the next batch boundary
+// (or during an inter-batch sleep slice).  Read via a pointer stored
+// in EnrichOptions.cancelled -- see the auto_recover block below.
+static std::atomic<bool>     g_recovery_shutdown{false};
 
 static void signal_handler(int) {
   if (g_listener) g_listener->stop();
   if (g_poller)   g_poller->stop();
+  g_recovery_shutdown.store(true, std::memory_order_relaxed);
 }
 
 // ============================================================
@@ -1074,40 +1080,60 @@ int main(int argc, char* argv[]) {
   // actually need work (sparse metadata OR orphaned detectionLabels.objectId
   // without a matching SDO), so on a healthy fully-enriched DB it's a
   // single empty-result query and exits immediately.
+  //
+  // Runs on a background thread so the main startup path isn't blocked
+  // by potentially many minutes of DB work.  The enrich phase issues
+  // small SELECTs (LIMIT-paginated, adaptive size, ~2 s target per
+  // batch) with a 50 %% duty-cycle sleep between them so the normal
+  // Protect DB traffic isn't starved.  Shutdown cooperatively cancels
+  // via g_recovery_shutdown at the next batch boundary or inter-batch
+  // sleep slice, so the process exits promptly on SIGTERM without
+  // having to wait for a whole scan to finish.
+  std::thread auto_recover_thread;
   if (absl::GetFlag(FLAGS_auto_recover_events)) {
     const uint64_t thresh_ms =
         static_cast<uint64_t>(absl::GetFlag(FLAGS_auto_recover_threshold_hours))
         * 3'600'000ULL;
-    PGconn* rec_conn = PQconnectdb(db_conn.c_str());
-    if (PQstatus(rec_conn) == CONNECTION_OK) {
-      // Phase 1: restore from backup if needed.
-      if (onvif::event_recovery::ShouldRecover(rec_conn, thresh_ms)) {
+    auto_recover_thread = std::thread([db_conn, thresh_ms]() {
+      PGconn* rec_conn = PQconnectdb(db_conn.c_str());
+      if (PQstatus(rec_conn) != CONNECTION_OK) {
+        LOG(WARNING) << "[auto_recover] DB connect failed: "
+                     << PQerrorMessage(rec_conn);
+        PQfinish(rec_conn);
+        return;
+      }
+      // Phase 1: restore from backup if needed.  Small + fast; not
+      // batched.  Skip if shutdown was already requested before the
+      // thread got scheduled.
+      if (!g_recovery_shutdown.load(std::memory_order_relaxed) &&
+          onvif::event_recovery::ShouldRecover(rec_conn, thresh_ms)) {
         auto backup = onvif::event_recovery::FindLatestBackup(
             "/srv/unifi-protect/dbBackups");
         if (backup) {
           LOG(INFO) << "[auto_recover] restoring from " << backup->path;
-          auto s = onvif::event_recovery::RestoreFromBackup(rec_conn, backup->path);
+          auto s = onvif::event_recovery::RestoreFromBackup(rec_conn,
+                                                            backup->path);
           if (!s.ok())
             LOG(ERROR) << "[auto_recover] restore failed: " << s.message();
         } else {
-          LOG(INFO) << "[auto_recover] no backup file under /srv/unifi-protect/dbBackups";
+          LOG(INFO) << "[auto_recover] no backup file under "
+                       "/srv/unifi-protect/dbBackups";
         }
       }
       // Phase 2: enrich any events still missing rich-format detail rows.
       // Runs unconditionally (still version-gated inside) -- catches both
       // the events Phase 1 just restored AND events from earlier restores
       // whose SDO/SDA rows weren't preserved.
-      if (onvif::protect_version::IsAtLeast(7, 1, 0)) {
-        auto s = onvif::event_recovery::EnrichRestored(rec_conn);
+      if (!g_recovery_shutdown.load(std::memory_order_relaxed) &&
+          onvif::protect_version::IsAtLeast(7, 1, 0)) {
+        onvif::event_recovery::EnrichOptions opts;
+        opts.cancelled = &g_recovery_shutdown;
+        auto s = onvif::event_recovery::EnrichRestored(rec_conn, opts);
         if (!s.ok())
           LOG(ERROR) << "[auto_recover] enrich failed: " << s.message();
       }
       PQfinish(rec_conn);
-    } else {
-      LOG(WARNING) << "[auto_recover] DB connect failed: "
-                   << PQerrorMessage(rec_conn);
-      PQfinish(rec_conn);
-    }
+    });
   }
 
   if (absl::GetFlag(FLAGS_coalesce_history)) {
@@ -1240,6 +1266,14 @@ int main(int argc, char* argv[]) {
     motion_poller->stop();
   if (backfill_thread.joinable())
     backfill_thread.join();
+  // Nudge the background auto-recover thread to exit and wait for it.
+  // The signal handler already flipped g_recovery_shutdown on SIGTERM /
+  // SIGINT, but if we're here via a clean listener.run() return we need
+  // to set it ourselves so the loop bails at the next batch/sleep
+  // boundary instead of running to completion.
+  g_recovery_shutdown.store(true, std::memory_order_relaxed);
+  if (auto_recover_thread.joinable())
+    auto_recover_thread.join();
   g_poller   = nullptr;
   g_listener = nullptr;
   onvif::global_cleanup();
