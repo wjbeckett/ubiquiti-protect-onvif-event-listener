@@ -131,6 +131,62 @@ static void test_sanitize_kv_passwords() {
         "single-quoted passwd redacted");
 }
 
+// Field-observed leak on issue #34: raw camera passwords + usernames
+// slipped through cameras.json because the Protect
+// thirdPartyCameraInfo JSONB column carries them as
+// `"password": "value"` and the old regex expected the char after the
+// keyword to be `[=:]` or whitespace -- but in JSON it's the closing
+// double-quote of the key.  These tests use synthetic values only.
+static void test_sanitize_kv_json_form() {
+  onvif::DumpSanitizer s;
+  const std::string in =
+      "{\"password\":\"hunter2\","
+      "\"username\":\"admin\","
+      "\"passwd\": \"space pw\","
+      "\"pwd\":\"quick\","
+      "\"user\": \"root\"}";
+  const std::string out = s.sanitize(in);
+  check(out.find("hunter2")   == std::string::npos, "JSON password redacted");
+  check(out.find("admin")     == std::string::npos, "JSON username redacted");
+  check(out.find("space pw")  == std::string::npos, "JSON passwd redacted");
+  check(out.find("\"quick\"") == std::string::npos, "JSON pwd redacted");
+  check(out.find("\"root\"")  == std::string::npos, "JSON user redacted");
+  check(out.find("[REDACTED]") != std::string::npos,
+        "redaction marker present");
+}
+
+static void test_sanitize_kv_python_repr_form() {
+  // Python repr uses single quotes: 'password': 'value'.  Same leak
+  // path if anyone dumps a dict via repr().
+  onvif::DumpSanitizer s;
+  const std::string out = s.sanitize(
+      "{'password': 'hunter2', 'username': 'admin'}");
+  check(out.find("hunter2") == std::string::npos,
+        "single-quoted JSON-ish password redacted");
+  check(out.find("admin")   == std::string::npos,
+        "single-quoted JSON-ish username redacted");
+}
+
+static void test_sanitize_kv_does_not_touch_lookalike_keys() {
+  // Regression guard: keys that only *begin* with 'user' /
+  // 'password' must not have their value chewed off.
+  onvif::DumpSanitizer s;
+  const std::string in =
+      "{\"userId\":\"keep-me\","
+      "\"userAgent\":\"Mozilla/5.0\","
+      "\"passwordHash\":\"$2b$12$abc\"}";
+  const std::string out = s.sanitize(in);
+  check(out.find("keep-me")     != std::string::npos,
+        "userId value preserved");
+  check(out.find("Mozilla/5.0") != std::string::npos,
+        "userAgent value preserved");
+  // passwordHash begins with "password" -- the \b at the start plus
+  // requiring [\"']?\s*[=:] after the keyword prevents matching
+  // (H is a word char so \b password + Hash does not fire).
+  check(out.find("$2b$12$abc")  != std::string::npos,
+        "passwordHash value preserved (not a real password field)");
+}
+
 static void test_sanitize_url_creds() {
   onvif::DumpSanitizer s;
   const std::string in =
@@ -437,6 +493,9 @@ int main() {
   test_sanitize_ignores_versions();
   test_sanitize_wsse_tags();
   test_sanitize_kv_passwords();
+  test_sanitize_kv_json_form();
+  test_sanitize_kv_python_repr_form();
+  test_sanitize_kv_does_not_touch_lookalike_keys();
   test_sanitize_url_creds();
   test_sanitize_rtsp_creds();
   test_sanitize_basic_auth_header();

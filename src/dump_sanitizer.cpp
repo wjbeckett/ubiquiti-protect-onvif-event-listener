@@ -180,16 +180,32 @@ std::string DumpSanitizer::sanitize(const std::string& in) {
       "<wsse:Nonce>[REDACTED]</wsse:Nonce>");
 
   // -------- key=value secrets (any quoting / unquoted) --------
-  // Matches: password=foo, password = "foo bar", password='x', etc.
-  // We deliberately keep the key + separator and replace just the
-  // value so the format remains parseable.
+  // Matches: password=foo, password = "foo bar", password='x',
+  // "password": "foo", 'password':'foo', password:foo, etc.  The
+  // optional trailing ["'] after the key catches the closing quote of
+  // a JSON / Python-repr key (e.g. `"password": "value"` or
+  // `'password': 'value'`), which the previous rule missed --
+  // field-observed on issue #34 where the Protect
+  // cameras.thirdPartyCameraInfo JSONB column carried raw camera
+  // usernames + passwords through the pipeline unredacted.  We keep
+  // the key + separator and replace just the value so downstream
+  // parsers still work.
+  // For the *unquoted* value alternative we also exclude `@` and `/`
+  // so this rule doesn't chew up URL basic-auth like
+  // `rtsp://user:pass@host/stream` -- that URL is handled by the URL-
+  // creds rule below, but only if user_kv_re / pw_kv_re leave the `@`
+  // in place.  Quoted values (double or single) still accept any char
+  // inside the quotes, matching how JSON / INI / shell store secrets
+  // that contain URL characters.
   static const std::regex pw_kv_re(
-      R"(((?:password|passwd|pwd)\s*[=:]\s*)("[^"]*"|'[^']*'|[^\s,;&"']+))",
+      R"((\b(?:password|passwd|pwd)["']?\s*[=:]\s*))"
+      R"(("[^"]*"|'[^']*'|[^\s,;&"'@/]+))",
       std::regex::icase);
   out = std::regex_replace(out, pw_kv_re, "$1[REDACTED]");
 
   static const std::regex user_kv_re(
-      R"((\b(?:username|user)\s*=\s*)("[^"]*"|'[^']*'|[^\s,;&"']+))",
+      R"((\b(?:username|user)["']?\s*[=:]\s*))"
+      R"(("[^"]*"|'[^']*'|[^\s,;&"'@/]+))",
       std::regex::icase);
   out = std::regex_replace(out, user_kv_re, "$1[REDACTED]");
 
