@@ -310,6 +310,14 @@ ABSL_FLAG(std::string, rollback, "",
     "Values: 'third_party', 'first_party', 'all'. "
     "Uses --change_log file if it exists; otherwise guesstimates "
     "from current code for third-party cameras.");
+ABSL_FLAG(std::string, excluded_cameras, "",
+    "Comma-separated list of camera MAC addresses that onvif-recorder "
+    "should ignore entirely -- no ONVIF subscription (third-party) and "
+    "no motion-poll cycles (first-party).  Useful when a camera is "
+    "already managed by another integration (e.g. a UniFi AI Port) and "
+    "would otherwise produce duplicate detection events (issue #42).  "
+    "Managed via a per-row tickbox on the Camera Health card at "
+    "/onvif/admin/.");
 ABSL_FLAG(std::string, first_party_cameras, "",
     "Comma-separated camera IDs of first-party cameras to enable smart "
     "detection flags for in the cameras table. Enables the Protect UI "
@@ -502,6 +510,30 @@ int main(int argc, char* argv[]) {
   const std::string fp_cam_str  = absl::GetFlag(FLAGS_first_party_cameras);
   const std::string fp_model_str =
       absl::GetFlag(FLAGS_first_party_camera_models);
+
+  // --excluded_cameras (issue #42): lower-cased, colon-stripped MAC set.
+  // Both the third-party listener add loop and the first-party motion
+  // poller add loop consult it.  Normalising both the flag values and
+  // each camera's MAC before comparison handles the mix of colonised /
+  // bare-hex forms present across the codebase.
+  auto norm_mac = [](std::string s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+      if (c == ':' || c == '-' || c == ' ') continue;
+      out += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return out;
+  };
+  std::set<std::string> excluded_macs;
+  for (const auto& raw : parse_csv(absl::GetFlag(FLAGS_excluded_cameras))) {
+    const std::string m = norm_mac(raw);
+    if (!m.empty()) excluded_macs.insert(m);
+  }
+  if (!excluded_macs.empty()) {
+    LOG(INFO) << "[excluded_cameras] " << excluded_macs.size()
+              << " camera MAC(s) will be skipped";
+  }
   const uint32_t pre_buf_sec    =
       static_cast<uint32_t>(absl::GetFlag(FLAGS_pre_buffer_sec));
   const uint32_t post_buf_sec   =
@@ -957,6 +989,11 @@ int main(int argc, char* argv[]) {
                           const std::string& name,
                           const std::string& mac) {
       if (id.empty() || !seen.insert(id).second) return;
+      if (!mac.empty() && excluded_macs.count(norm_mac(mac))) {
+        LOG(INFO) << "[excluded_cameras] skipping first-party "
+                  << name << " (" << id << ", mac=" << mac << ")";
+        return;
+      }
       fp_ids.push_back(id);
       first_party_managed_ids.insert(id);
       if (!mac.empty()) fp_macs[id] = mac;
@@ -1171,6 +1208,11 @@ int main(int argc, char* argv[]) {
   }
 
   for (auto cam : cameras) {
+    if (!cam.mac.empty() && excluded_macs.count(norm_mac(cam.mac))) {
+      LOG(INFO) << "[excluded_cameras] skipping "
+                << cam.ip << " mac=" << cam.mac;
+      continue;
+    }
     cam.max_consecutive_failures = 3;
     listener.add_camera(cam);
     det_rec.set_snapshot(cam);

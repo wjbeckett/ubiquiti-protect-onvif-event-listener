@@ -61,6 +61,14 @@ const std::vector<Entry>& Schema() {
      "briefly loses sight and re-fires (issue #29).",
      "Detection"},
 
+    {"excluded_cameras", Type::String,
+     "Comma-separated MAC addresses of cameras onvif-recorder should "
+     "ignore entirely (no ONVIF subscription, no motion polling).  Use "
+     "the Enabled tickbox on the Camera Health card above to manage "
+     "this.  Useful when another integration (e.g. a UniFi AI Port) is "
+     "already producing detection events for the same physical camera.",
+     "Detection"},
+
     // ---- First-party cameras ----
     {"first_party_cameras", Type::String,
      "Comma-separated camera IDs to enable smart-detect for.  Use the "

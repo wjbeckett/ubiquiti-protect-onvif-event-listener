@@ -125,12 +125,16 @@ font-weight:600;text-transform:uppercase;letter-spacing:.04em}
 <th style="padding:4px 6px">1h</th>
 <th style="padding:4px 6px"></th>
 <th style="padding:4px 6px" title="Route thumbnail fetches through Protect's own snapshot API instead of hitting the camera directly. Useful for cameras that struggle with concurrent requests. Third-party cameras only.">Via Protect</th>
+<th style="padding:4px 6px" title="Untick to skip this camera entirely (no ONVIF subscription for third-party, no motion polling for first-party). Useful when another integration (e.g. a UniFi AI Port) is already handling the same physical camera and would otherwise produce duplicate events. Saved as excluded_cameras (issue #42).">Enabled</th>
 </tr></thead>
-<tbody id="camhealth-body"><tr><td colspan="7">Loading…</td></tr></tbody></table>
-<div style="margin-top:8px;display:flex;gap:12px;align-items:center">
+<tbody id="camhealth-body"><tr><td colspan="8">Loading…</td></tr></tbody></table>
+<div style="margin-top:8px;display:flex;gap:12px;align-items:center;flex-wrap:wrap">
   <button id="save-via-protect" onclick="saveViaProtect()" disabled
           style="padding:4px 12px;font-size:12px">Save via-Protect changes</button>
   <span id="save-via-protect-msg" style="font-size:12px;color:#9aa0a6"></span>
+  <button id="save-enabled" onclick="saveEnabled()" disabled
+          style="padding:4px 12px;font-size:12px">Save Enabled changes</button>
+  <span id="save-enabled-msg" style="font-size:12px;color:#9aa0a6"></span>
 </div></div>
 
 <div class="card"><h2>Release channel</h2>
@@ -304,6 +308,7 @@ function renderConfigForm(entries){
   for (const e of entries){
     if (e.name === 'first_party_cameras') continue;  // rendered separately
     if (e.name === 'camera_snapshot_via_protect') continue;  // rendered as tickboxes on the Camera Health card
+    if (e.name === 'excluded_cameras') continue;              // rendered as Enabled tickboxes on the Camera Health card
     if (e.group !== lastGroup){
       html += `<div class="cfg-section">${e.group}</div>`;
       lastGroup = e.group;
@@ -370,6 +375,7 @@ async function saveConfig(){
   for (const e of configEntries){
     if (e.name === 'first_party_cameras') continue;
     if (e.name === 'camera_snapshot_via_protect') continue;  // saved by the tickbox flow
+    if (e.name === 'excluded_cameras') continue;              // saved by the Enabled tickbox flow
     const el = document.getElementById('cfg-' + e.name);
     if (el) values[e.name] = el.value || '';
   }
@@ -472,13 +478,53 @@ async function saveViaProtect(){
   }
 }
 
+// Enabled tick-box state.  Semantically the *inverse* of the
+// excluded_cameras config field: an unchecked box means the camera's
+// MAC is included in the excluded_cameras CSV.  Keyed by MAC because
+// that is what the enforcement side in main.cpp compares against.
+let enabledLocal   = new Set();  // includes unsaved changes (excluded MACs)
+let enabledServer  = new Set();  // as-persisted on server (excluded MACs)
+
+function updateSaveEnabledState(){
+  const dirty = enabledServer.size !== enabledLocal.size
+             || [...enabledLocal].some(m => !enabledServer.has(m));
+  const btn = document.getElementById('save-enabled');
+  if (btn) btn.disabled = !dirty;
+  const msg = document.getElementById('save-enabled-msg');
+  if (msg && !dirty) msg.textContent = '';
+}
+function toggleEnabled(mac, checked){
+  // checked = camera runs normally.  unchecked = add MAC to the
+  // excluded_cameras set so the listener skips it after restart.
+  if (checked) enabledLocal.delete(mac);
+  else         enabledLocal.add(mac);
+  updateSaveEnabledState();
+}
+async function saveEnabled(){
+  const csv = [...enabledLocal].sort().join(',');
+  const msg = document.getElementById('save-enabled-msg');
+  const sp  = document.getElementById('spinner');
+  document.getElementById('spinner-text').textContent =
+      'Saving Enabled changes and restarting service…';
+  sp.classList.add('on');
+  try {
+    const r = await post('api/config', { excluded_cameras: csv });
+    if (!r.ok) { if (msg) msg.textContent = r.text; sp.classList.remove('on'); return; }
+    await waitForRestart();
+    await loadCameraHealth();
+    if (msg) { msg.textContent = 'Saved.'; msg.style.color = '#a0e0a0'; }
+  } finally {
+    sp.classList.remove('on');
+  }
+}
+
 async function loadCameraHealth(){
   try {
     const r = captureCsrf(await fetch('api/camera_health'));
     const j = await r.json();
     const body = document.getElementById('camhealth-body');
     if (!j.cameras || !j.cameras.length){
-      body.innerHTML = '<tr><td colspan="7" style="color:#7a8190">No adopted cameras.</td></tr>';
+      body.innerHTML = '<tr><td colspan="8" style="color:#7a8190">No adopted cameras.</td></tr>';
       return;
     }
     // Re-seed via-Protect state from server, but preserve any local
@@ -490,11 +536,21 @@ async function loadCameraHealth(){
     viaProtectServer = nextServer;
     if (!wasDirty) viaProtectLocal = new Set(viaProtectServer);
     updateSaveViaProtectState();
+    // Same seed/preserve pattern for the Enabled column.
+    const wasEnabledDirty =
+        document.getElementById('save-enabled')?.disabled === false;
+    const nextEnabledServer = new Set();
+    for (const c of j.cameras) {
+      if (c.excluded && c.mac) nextEnabledServer.add(c.mac);
+    }
+    enabledServer = nextEnabledServer;
+    if (!wasEnabledDirty) enabledLocal = new Set(enabledServer);
+    updateSaveEnabledState();
     const now = j.now_ms || Date.now();
     body.innerHTML = j.cameras.map(c => {
       const age = c.last_event_ms ? (now - c.last_event_ms) : null;
       const hintRow = c.hint === 'needs_onvif_admin'
-        ? `<tr><td colspan="7" style="padding:4px 6px 8px 22px;color:#f0c674;font-size:11px;border-top:0">
+        ? `<tr><td colspan="8" style="padding:4px 6px 8px 22px;color:#f0c674;font-size:11px;border-top:0">
              &#9888; ONVIF event subscription rejected with <code>ter:NotAuthorized</code>.
              Most Hikvision firmware (and OEM rebadges) require a separate ONVIF user with
              <b>Administrator</b> privileges -- web-UI admin alone is not enough.
@@ -516,6 +572,14 @@ async function loadCameraHealth(){
         ? `<input type="checkbox" ${checked}
                   onchange="toggleViaProtect('${c.host}', this.checked)">`
         : '<span style="color:#5a6070">—</span>';
+      // Enabled tickbox: shown for every camera we can identify by MAC
+      // (cameras without a MAC in the DB, which is rare, can't be
+      // excluded because the enforcement side matches on MAC).
+      // Checked = camera runs normally; unchecked = excluded.
+      const enabledCell = c.mac
+        ? `<input type="checkbox" ${enabledLocal.has(c.mac) ? '' : 'checked'}
+                  onchange="toggleEnabled('${c.mac}', this.checked)">`
+        : '<span style="color:#5a6070" title="No MAC on file -- cannot exclude">—</span>';
       return `<tr>
         <td style="padding:4px 6px">${c.name || '(unnamed)'}</td>
         <td style="padding:4px 6px;color:#9aa0a6">${c.host || '-'}</td>
@@ -526,11 +590,12 @@ async function loadCameraHealth(){
             ? '<span class="pill red">auth</span>'
             : pillFor(age)}${backoffPill}</td>
         <td style="padding:4px 6px;text-align:center">${viaCell}</td>
+        <td style="padding:4px 6px;text-align:center">${enabledCell}</td>
       </tr>${hintRow}`;
     }).join('');
   } catch (e) {
     document.getElementById('camhealth-body').innerHTML =
-      '<tr><td colspan="7" style="color:#e0a0a0">Failed to load camera health.</td></tr>';
+      '<tr><td colspan="8" style="color:#e0a0a0">Failed to load camera health.</td></tr>';
   }
 }
 
@@ -1037,30 +1102,49 @@ std::string build_camera_health_json(const Ctx& ctx) {
       health_by_ip[ip] = std::move(h);
     }
   }
-  // Load the persisted camera_snapshot_via_protect setting so the UI
-  // can pre-tick the right rows.  Reads the same config.json the config
-  // form writes to, so this stays in sync with the tickboxes.
+  // Load the persisted camera_snapshot_via_protect and excluded_cameras
+  // settings so the UI can pre-tick the right rows.  Reads the same
+  // config.json the config form writes to, so this stays in sync with
+  // the tickboxes.  excluded_cameras is keyed by MAC (lower-case,
+  // colon-stripped) to match the same normalisation the enforcement
+  // side in main.cpp does.
+  auto parse_csv_tokens = [](const std::string& s) {
+    std::set<std::string> out;
+    size_t start = 0;
+    while (start <= s.size()) {
+      size_t comma = s.find(',', start);
+      std::string tok = s.substr(start,
+          comma == std::string::npos ? std::string::npos : comma - start);
+      while (!tok.empty() && (tok.front() == ' ' || tok.front() == '\t'))
+        tok.erase(tok.begin());
+      while (!tok.empty() && (tok.back() == ' ' || tok.back() == '\t'))
+        tok.pop_back();
+      if (!tok.empty()) out.insert(tok);
+      if (comma == std::string::npos) break;
+      start = comma + 1;
+    }
+    return out;
+  };
+  auto norm_mac = [](std::string s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+      if (c == ':' || c == '-' || c == ' ') continue;
+      out += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return out;
+  };
   std::set<std::string> via_protect_ips;
+  std::set<std::string> excluded_macs;
   {
     auto overrides = runtime_config::ReadFromFile(
         ctx.config_path ? ctx.config_path : "");
     auto vit = overrides.find("camera_snapshot_via_protect");
-    if (vit != overrides.end()) {
-      std::string s = vit->second;
-      size_t start = 0;
-      while (start <= s.size()) {
-        size_t comma = s.find(',', start);
-        std::string tok = s.substr(start,
-            comma == std::string::npos ? std::string::npos : comma - start);
-        // trim
-        while (!tok.empty() && (tok.front() == ' ' || tok.front() == '\t'))
-          tok.erase(tok.begin());
-        while (!tok.empty() && (tok.back() == ' ' || tok.back() == '\t'))
-          tok.pop_back();
-        if (!tok.empty()) via_protect_ips.insert(tok);
-        if (comma == std::string::npos) break;
-        start = comma + 1;
-      }
+    if (vit != overrides.end()) via_protect_ips = parse_csv_tokens(vit->second);
+    auto eit = overrides.find("excluded_cameras");
+    if (eit != overrides.end()) {
+      for (const auto& m : parse_csv_tokens(eit->second))
+        excluded_macs.insert(norm_mac(m));
     }
   }
   bool first = true;
@@ -1087,6 +1171,13 @@ std::string build_camera_health_json(const Ctx& ctx) {
     if (r.is_third_party) {
       j += ",\"snapshot_via_protect\":";
       j += via_protect_ips.count(r.host) ? "true" : "false";
+    }
+    // Enabled tickbox state: reflect the persisted excluded_cameras
+    // config so the UI can pre-tick the right rows.  Normalised on
+    // both sides (lower-case, colon-stripped).
+    if (!r.mac.empty()) {
+      j += ",\"excluded\":";
+      j += excluded_macs.count(norm_mac(r.mac)) ? "true" : "false";
     }
     if (camera_needs_onvif_admin(r.host)) {
       j += ",\"hint\":\"needs_onvif_admin\"";
