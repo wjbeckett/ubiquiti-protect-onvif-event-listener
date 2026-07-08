@@ -142,6 +142,21 @@ std::string regex_replace_with(const std::string& in,
 
 }  // namespace
 
+// Fast anchor pre-check.  Return true iff any of @p anchors appears
+// in @p hay.  The anchors are the case-insensitive substrings each
+// regex minimally needs to see -- if none appear, the regex cannot
+// match, and we skip the expensive std::regex pass entirely.  Two
+// alternatives per keyword (upper + lower first char) cover almost
+// all real logs; anything more exotic falls through to the case-
+// insensitive regex anyway if it slipped through the check.
+static bool contains_any(const std::string& hay,
+                          std::initializer_list<const char*> anchors) {
+  for (const char* a : anchors) {
+    if (hay.find(a) != std::string::npos) return true;
+  }
+  return false;
+}
+
 std::string DumpSanitizer::sanitize(const std::string& in) {
   std::string out = in;
 
@@ -153,7 +168,9 @@ std::string DumpSanitizer::sanitize(const std::string& in) {
   static const std::regex sentry_dsn_re(
       R"(https?://[0-9a-f]{32}@[^\s"'<>/]+\.ingest\.sentry\.io/\d+)",
       std::regex::icase);
-  out = std::regex_replace(out, sentry_dsn_re, "[REDACTED_SENTRY_DSN]");
+  if (contains_any(out, {"sentry.io", "Sentry.io", "SENTRY.IO"})) {
+    out = std::regex_replace(out, sentry_dsn_re, "[REDACTED_SENTRY_DSN]");
+  }
 
   // -------- IPv4 addresses --------
   // Word-bounded 4-octet pattern.  remap_ip() validates 0-255; out-of-
@@ -164,20 +181,25 @@ std::string DumpSanitizer::sanitize(const std::string& in) {
       [this](const std::smatch& m) { return remap_ip(m.str(0)); });
 
   // -------- WS-Security tag bodies --------
-  static const std::regex wsse_user_re(
-      R"(<wsse:Username[^>]*>[^<]*</wsse:Username>)");
-  out = std::regex_replace(out, wsse_user_re,
-      "<wsse:Username>[REDACTED]</wsse:Username>");
+  // WSSE tags are literal case-fixed strings (SOAP spec); anchor
+  // check on the shared `<wsse:` prefix skips the whole block on
+  // logs that carry no SOAP.
+  if (contains_any(out, {"<wsse:"})) {
+    static const std::regex wsse_user_re(
+        R"(<wsse:Username[^>]*>[^<]*</wsse:Username>)");
+    out = std::regex_replace(out, wsse_user_re,
+        "<wsse:Username>[REDACTED]</wsse:Username>");
 
-  static const std::regex wsse_pw_re(
-      R"(<wsse:Password[^>]*>[^<]*</wsse:Password>)");
-  out = std::regex_replace(out, wsse_pw_re,
-      "<wsse:Password>[REDACTED]</wsse:Password>");
+    static const std::regex wsse_pw_re(
+        R"(<wsse:Password[^>]*>[^<]*</wsse:Password>)");
+    out = std::regex_replace(out, wsse_pw_re,
+        "<wsse:Password>[REDACTED]</wsse:Password>");
 
-  static const std::regex wsse_nonce_re(
-      R"(<wsse:Nonce[^>]*>[^<]*</wsse:Nonce>)");
-  out = std::regex_replace(out, wsse_nonce_re,
-      "<wsse:Nonce>[REDACTED]</wsse:Nonce>");
+    static const std::regex wsse_nonce_re(
+        R"(<wsse:Nonce[^>]*>[^<]*</wsse:Nonce>)");
+    out = std::regex_replace(out, wsse_nonce_re,
+        "<wsse:Nonce>[REDACTED]</wsse:Nonce>");
+  }
 
   // -------- key=value secrets (any quoting / unquoted) --------
   // Matches: password=foo, password = "foo bar", password='x',
@@ -201,13 +223,19 @@ std::string DumpSanitizer::sanitize(const std::string& in) {
       R"((\b(?:password|passwd|pwd)["']?\s*[=:]\s*))"
       R"(("[^"]*"|'[^']*'|[^\s,;&"'@/]+))",
       std::regex::icase);
-  out = std::regex_replace(out, pw_kv_re, "$1[REDACTED]");
+  if (contains_any(out, {"password", "Password", "PASSWORD",
+                          "passwd", "Passwd",
+                          "pwd", "Pwd", "PWD"})) {
+    out = std::regex_replace(out, pw_kv_re, "$1[REDACTED]");
+  }
 
   static const std::regex user_kv_re(
       R"((\b(?:username|user)["']?\s*[=:]\s*))"
       R"(("[^"]*"|'[^']*'|[^\s,;&"'@/]+))",
       std::regex::icase);
-  out = std::regex_replace(out, user_kv_re, "$1[REDACTED]");
+  if (contains_any(out, {"user", "User", "USER"})) {
+    out = std::regex_replace(out, user_kv_re, "$1[REDACTED]");
+  }
 
   // -------- URL credentials: scheme://user:pass@host --------
   // Handles http(s), rtsp(s), and rtmp URLs.  Third-party cameras store
@@ -217,20 +245,26 @@ std::string DumpSanitizer::sanitize(const std::string& in) {
   static const std::regex url_creds_re(
       R"(((?:https?|rtsps?|rtmp)://)([^:/@\s]+):([^@\s]+)@)",
       std::regex::icase);
-  out = std::regex_replace(out, url_creds_re,
-      "$1[REDACTED]:[REDACTED]@");
+  if (contains_any(out, {"://"})) {
+    out = std::regex_replace(out, url_creds_re,
+        "$1[REDACTED]:[REDACTED]@");
+  }
 
   // -------- Authorization: Basic <base64> --------
   static const std::regex auth_basic_re(
       R"((Authorization:\s*Basic\s+)([A-Za-z0-9+/=]+))",
       std::regex::icase);
-  out = std::regex_replace(out, auth_basic_re, "$1[REDACTED]");
+  if (contains_any(out, {"Authorization", "authorization", "AUTHORIZATION"})) {
+    out = std::regex_replace(out, auth_basic_re, "$1[REDACTED]");
+  }
 
   // -------- X-UserId header (Protect API auth bypass token) --------
   static const std::regex xuserid_re(
       R"((X-UserId:\s*)([A-Za-z0-9._\-]+))",
       std::regex::icase);
-  out = std::regex_replace(out, xuserid_re, "$1[REDACTED]");
+  if (contains_any(out, {"X-UserId", "x-userid", "X-USERID"})) {
+    out = std::regex_replace(out, xuserid_re, "$1[REDACTED]");
+  }
 
   // -------- Query-string session values ---------
   // Protect UI/API URLs carry per-request correlators (uniqid=ws-<uuid>,
@@ -239,7 +273,11 @@ std::string DumpSanitizer::sanitize(const std::string& in) {
   static const std::regex session_qs_re(
       R"(([?&](?:uniqid|requestId|sessionId))=([^&\s"'<>]+))",
       std::regex::icase);
-  out = std::regex_replace(out, session_qs_re, "$1=[REDACTED]");
+  if (contains_any(out, {"uniqid", "requestId", "sessionId",
+                          "Uniqid", "RequestId", "SessionId",
+                          "UNIQID", "REQUESTID", "SESSIONID"})) {
+    out = std::regex_replace(out, session_qs_re, "$1=[REDACTED]");
+  }
 
   // -------- Streaming path tokens ---------
   // wss://host/<12+ base62 chars>?... and tcp://host:port/<12+ base62 chars>
@@ -251,7 +289,11 @@ std::string DumpSanitizer::sanitize(const std::string& in) {
   static const std::regex stream_path_re(
       R"(((?:wss?|tcp)://[^/\s"'<>]+/)([A-Za-z0-9]{12,}))",
       std::regex::icase);
-  out = std::regex_replace(out, stream_path_re, "$1[REDACTED_WS_TOKEN]");
+  if (contains_any(out, {"ws://", "wss://", "tcp://",
+                          "WS://", "WSS://", "TCP://"})) {
+    out = std::regex_replace(out, stream_path_re,
+                             "$1[REDACTED_WS_TOKEN]");
+  }
 
   // -------- UUIDs (36-char with dashes) ---------
   // 8-4-4-4-12 hex.  Ironclad accessId, sessionId payload values, Protect

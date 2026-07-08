@@ -39,6 +39,7 @@ typedef int MHD_Result;
 #include <set>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -1469,31 +1470,6 @@ std::string build_triage_json(const std::string& dump_dir) {
   collect_hashes(cameras, "id-",  &ids);
   collect_hashes(cameras, "mac-", &macs);
 
-  // Per-id error counters.  We scan for the strings independently of
-  // the id so a triager can correlate: `snapshot_errors_total` is the
-  // whole log's count, `snapshot_errors_by_id[id]` is that id's line-
-  // co-occurrence count (grep -c 'Snapshot not available.*id').
-  auto count_lines_with_both = [](const std::string& haystack,
-                                   const std::string& needle,
-                                   const std::string& id) -> int {
-    int hits = 0;
-    size_t pos = 0;
-    while (true) {
-      size_t start = haystack.find_last_of('\n', pos);
-      start = (start == std::string::npos) ? 0 : start + 1;
-      size_t end = haystack.find('\n', pos);
-      if (end == std::string::npos) end = haystack.size();
-      const std::string line = haystack.substr(start, end - start);
-      if (line.find(needle) != std::string::npos &&
-          line.find(id)     != std::string::npos) {
-        ++hits;
-      }
-      if (end >= haystack.size()) break;
-      pos = end + 1;
-    }
-    return hits;
-  };
-
   // Score every key, then emit sorted by total error weight desc so the
   // culprit camera surfaces on the first row without scrolling.
   struct Row {
@@ -1507,26 +1483,56 @@ std::string build_triage_json(const std::string& dump_dir) {
   std::vector<Row> rows;
   rows.reserve(ids.size() + macs.size());
   for (const auto& id : ids) {
-    Row r;
-    r.key       = id;
-    r.is_mac    = false;
-    r.snap_err  = count_lines_with_both(api,
-                    "Snapshot not available", id);
-    r.lost_rec  = count_lines_with_both(grpc,
-                    "Lost recording notification", id);
-    rows.push_back(std::move(r));
+    Row r; r.key = id;  r.is_mac = false; rows.push_back(std::move(r));
   }
   for (const auto& mac : macs) {
-    Row r;
-    r.key       = mac;
-    r.is_mac    = true;
-    r.snap_err  = count_lines_with_both(api,
-                    "Snapshot not available", mac);
-    r.lost_rec  = count_lines_with_both(grpc,
-                    "Lost recording notification", mac);
-    r.list_frag = count_lines_with_both(addon, "ListFragments", mac);
-    rows.push_back(std::move(r));
+    Row r; r.key = mac; r.is_mac = true;  rows.push_back(std::move(r));
   }
+  // Index rows by key AFTER all pushes so the pointers stay valid even
+  // if the reserve above ever gets out of sync with the actual push
+  // count.  string_view keys point into rows[].key.data() -- stable so
+  // long as rows[] isn't grown further, which we no longer do.
+  std::unordered_map<std::string_view, Row*> row_by_key;
+  row_by_key.reserve(rows.size());
+  for (auto& r : rows) row_by_key[r.key] = &r;
+
+  // Cross-reference each source-file / needle in ONE pass per file,
+  // instead of the previous O(cameras * files * bytes) approach.  Prior
+  // implementation was substr-per-line + N find() calls per line for
+  // each (camera, needle) tuple; on a 21-camera install with a few MB
+  // of api.log that dominated dump generation and drove the CPU peg
+  // reports on 1.6.12.  Now each file is walked line-by-line via
+  // string_view (no allocations) and per-line we only iterate the row
+  // map when the needle actually hit the line.
+  auto scan_file =
+      [&row_by_key](const std::string& haystack,
+                    std::string_view needle,
+                    int Row::*counter) {
+    if (haystack.empty() || needle.empty()) return;
+    size_t line_start = 0;
+    while (line_start < haystack.size()) {
+      size_t nl = haystack.find('\n', line_start);
+      const size_t line_end =
+          (nl == std::string::npos) ? haystack.size() : nl;
+      const std::string_view line(haystack.data() + line_start,
+                                  line_end - line_start);
+      if (line.find(needle) != std::string_view::npos) {
+        for (auto& kv : row_by_key) {
+          if (line.find(kv.first) != std::string_view::npos) {
+            ++(kv.second->*counter);
+          }
+        }
+      }
+      if (nl == std::string::npos) break;
+      line_start = nl + 1;
+    }
+  };
+  scan_file(api,   "Snapshot not available",       &Row::snap_err);
+  scan_file(grpc,  "Lost recording notification",  &Row::lost_rec);
+  scan_file(addon, "ListFragments",                &Row::list_frag);
+  // list_frag is only meaningful for MAC-typed rows (UBV paths use the
+  // camera's MAC); zero out any id-typed hits so the schema stays clean.
+  for (auto& r : rows) if (!r.is_mac) r.list_frag = 0;
   std::sort(rows.begin(), rows.end(),
             [](const Row& a, const Row& b) {
               if (a.score() != b.score()) return a.score() > b.score();
@@ -1601,9 +1607,10 @@ absl::Status build_diagnostic_dump(const Ctx& ctx,
   // 8 MiB cap per file keeps a verbose 12-hour journal intact (journald
   // averages ~150 B/line on this service so 8 MiB ≈ 50 k lines) while
   // still bounding worst-case memory.
-  auto capture = [&dir, &san](const char* name, const std::string& cmd) {
+  auto capture = [&dir, &san](const char* name, const std::string& cmd,
+                              size_t max_bytes = 3 * 1024 * 1024) {
     std::string out;
-    run_cmd(cmd, &out, 8 * 1024 * 1024);
+    run_cmd(cmd, &out, max_bytes);
     std::ofstream f(dir + "/" + name, std::ios::binary | std::ios::trunc);
     if (f.is_open()) f << san.sanitize(out);
   };
@@ -1619,10 +1626,13 @@ absl::Status build_diagnostic_dump(const Ctx& ctx,
   // they land on disk.
   write("cameras.json",         build_cameras_json(ctx));
   write("recording_files.json", build_recording_files_json(ctx));
-  // 12h window covers the typical "I noticed it broke this morning" report
-  // without blowing past journald's default retention on UDM.
+  // 3h window covers the typical "just tried it and it broke" report
+  // without blowing past journald's default retention on UDM.  Larger
+  // windows on installs with high event volume produced 8+ MiB of log
+  // that then dominated dump-generation CPU on 1.6.12 (every byte
+  // hits the full sanitiser regex pipeline); users saw the box hang.
   capture("journal.log",
-          "journalctl -u onvif-recorder --since '12 hours ago' "
+          "journalctl -u onvif-recorder --since '3 hours ago' "
           "--no-pager 2>/dev/null");
   // Previous-boot journal — invaluable when the service crashed and is
   // the very thing the user is reporting.  Falls back gracefully if
@@ -1645,20 +1655,27 @@ absl::Status build_diagnostic_dump(const Ctx& ctx,
   //   protect-grpc-client.log  Protect app -> MSR gRPC calls
   //   protect-app.log          Bootstrap + middleware lifecycle
   //   mst.log                  Media Server Transcoder decode/rescale ops
+  // Protect-log tails.  Prior sizes (5000 lines on api.log, 2000 on
+  // three others) drove dump-generation CPU to 100% on installs with
+  // large Protect log volumes -- every captured file goes through the
+  // full DumpSanitizer regex pipeline (~15 passes) before landing on
+  // disk, so file bytes translate directly into CPU seconds.  Halved
+  // across the board here; triage.json's new single-pass cross-
+  // referencing recovers the coverage we lose.
   capture("protect-addon.log",
-          "tail -n 2000 /srv/unifi-protect/logs/addon.log 2>/dev/null "
+          "tail -n 1000 /srv/unifi-protect/logs/addon.log 2>/dev/null "
           "|| echo '(addon.log not readable)'");
   capture("protect-api.log",
-          "tail -n 5000 /srv/unifi-protect/logs/api.log 2>/dev/null "
+          "tail -n 1500 /srv/unifi-protect/logs/api.log 2>/dev/null "
           "|| echo '(api.log not readable)'");
   capture("protect-grpc-client.log",
-          "tail -n 2000 /srv/unifi-protect/logs/GRPC.client.log 2>/dev/null "
+          "tail -n 1000 /srv/unifi-protect/logs/GRPC.client.log 2>/dev/null "
           "|| echo '(GRPC.client.log not readable)'");
   capture("protect-app.log",
-          "tail -n 1000 /srv/unifi-protect/logs/app.log 2>/dev/null "
+          "tail -n 500 /srv/unifi-protect/logs/app.log 2>/dev/null "
           "|| echo '(app.log not readable)'");
   capture("mst.log",
-          "tail -n 2000 /srv/ms/logs/mst.log 2>/dev/null "
+          "tail -n 1000 /srv/ms/logs/mst.log 2>/dev/null "
           "|| echo '(mst.log not readable)'");
   // Triage summary -- per-camera error counts across the sanitised
   // captures above.  Must run AFTER those writes so it reads back the
@@ -1667,10 +1684,25 @@ absl::Status build_diagnostic_dump(const Ctx& ctx,
   // no-op.
   write("triage.json", build_triage_json(dir));
   // Raw ONVIF SOAP exchange log — sourced from the always-on in-memory
-  // ring (see RawSink in onvif_listener).  No flag required: the dump
-  // always contains the most recent ~1000 exchanges (~8 MiB cap).
-  // --raw_log additionally tees to disk for long-form captures.
-  write("raw-onvif.jsonl", RawSink::instance().snapshot());
+  // ring (see RawSink in onvif_listener).  We cap the snapshot to the
+  // last ~2 MiB before sanitising because the compressed 64 MiB ring
+  // can decompress to 100+ MiB of SOAP XML and that dominated dump-
+  // generation CPU on 1.6.12 (every byte hits the full sanitiser regex
+  // pipeline).  Whole-line preserving: back up to the previous '\n'
+  // so no partial JSON object leaks.  --raw_log additionally tees
+  // uncompressed to disk for long-form captures.
+  {
+    std::string raw = RawSink::instance().snapshot();
+    constexpr size_t kRawCapBytes = 2 * 1024 * 1024;
+    if (raw.size() > kRawCapBytes) {
+      const size_t drop = raw.size() - kRawCapBytes;
+      const size_t nl = raw.find('\n', drop);
+      raw = (nl == std::string::npos)
+                ? std::string()
+                : raw.substr(nl + 1);
+    }
+    write("raw-onvif.jsonl", raw);
+  }
   // Parsed-event log (--event_log) is still file-based; tail last 5000
   // lines when the flag is set, skip silently otherwise.
   if (ctx.event_log_path && ctx.event_log_path[0] != '\0') {
