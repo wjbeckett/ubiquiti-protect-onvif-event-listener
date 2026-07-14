@@ -86,6 +86,16 @@ int main() {
     }
   }
 
+  // HTTP 500 should trigger re-registration, other codes should not.
+  {
+    check(AlarmNotifierTest::should_re_register(500),
+          "HTTP 500 triggers re-registration");
+    check(!AlarmNotifierTest::should_re_register(204),
+          "HTTP 204 does not re-register");
+    check(!AlarmNotifierTest::should_re_register(401),
+          "HTTP 401 does not re-register");
+  }
+
   // Deleted entries are dropped.
   {
     const std::string json = R"([
