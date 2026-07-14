@@ -128,6 +128,9 @@ Admin UI -> Detection -> camera_object_types
   -> 192.168.1.108=animal -> Save & restart
 ```
 
+## Notification Thumbnails
+By default, object detection notifications will arrive with no thumbnail attached. In order to receive thumbnails as well, you'll need  to enable the global alarm manager.
+Details on how to do this and the associated limitations are in [`THUMBNAILS.md`](THUMBNAILS.md)
 
 
 ## Troubleshooting
