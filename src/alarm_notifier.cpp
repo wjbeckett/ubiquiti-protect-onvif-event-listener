@@ -171,47 +171,6 @@ static std::set<std::string> parse_sources(const std::string& arr) {
   return devs;
 }
 
-// Parse the camera list from GET /api/cameras.
-// Returns a map from uppercase-no-colon MAC → camera DB UUID.
-// The UUID is required by buildEventFromSource (Protect service.js) to resolve
-// the live event row and attach a thumbnail to push notifications.
-static std::map<std::string, std::string> parse_cameras(
-    const std::string& json) {
-  std::map<std::string, std::string> result;
-  bool in_str = false;
-  bool escape = false;
-  int depth = 0;
-  size_t start = std::string::npos;
-
-  for (size_t i = 0; i < json.size(); ++i) {
-    char c = json[i];
-    if (escape) { escape = false; continue; }
-    if (in_str) {
-      if (c == '\\') escape = true;
-      else if (c == '"') in_str = false;
-      continue;
-    }
-    if (c == '"') { in_str = true; continue; }
-    if (c == '{') {
-      if (depth == 0) start = i;
-      ++depth;
-    } else if (c == '}') {
-      --depth;
-      if (depth == 0 && start != std::string::npos) {
-        const std::string obj = json.substr(start, i - start + 1);
-        size_t p = find_key(obj, 0, "id");
-        std::string id;
-        if (p != std::string::npos) id = extract_string(obj, p);
-        p = find_key(obj, 0, "mac");
-        std::string mac;
-        if (p != std::string::npos) mac = extract_string(obj, p);
-        if (!id.empty() && !mac.empty()) result[mac] = id;
-        start = std::string::npos;
-      }
-    }
-  }
-  return result;
-}
 
 }  // namespace
 
@@ -642,18 +601,43 @@ void AlarmNotifier::refresh_alarms() {
 
   // ---- Step 1: build MAC → camera DB UUID map --------------------------------
   // Protect's buildEventFromSource looks up cameras by DB UUID (PK), not MAC.
-  // We need this map so notify() can pass sourceEvent.cameraId correctly and
-  // the push notification pipeline can attach thumbnails to outgoing pushes.
-  const std::string cams_json = http_get(url + "/api/cameras");
-  if (!cams_json.empty()) {
-    auto cam_map = parse_cameras(cams_json);
-    LOG(INFO) << "[alarm] loaded " << cam_map.size()
-              << " camera(s) from Protect API";
-    absl::MutexLock lk(&mu_);
-    mac_to_camera_id_ = std::move(cam_map);
+  // We query the DB directly rather than parsing the /api/cameras JSON response
+  // because Protect wraps the camera array in an envelope object whose exact
+  // schema varies by version, making JSON parsing fragile.  The DB is the
+  // single source of truth that Protect itself reads from.
+  if (!db_connstr_.empty()) {
+    PGconn* cam_conn = PQconnectdb(db_connstr_.c_str());
+    if (PQstatus(cam_conn) == CONNECTION_OK) {
+      PGresult* cam_res = onvif::pg::ExecParamsWithTimeout(
+          cam_conn, /*timeout_ms=*/-1,
+          "SELECT id, mac FROM cameras",
+          0, nullptr, nullptr, nullptr, nullptr, 0);
+      if (PQresultStatus(cam_res) == PGRES_TUPLES_OK) {
+        std::map<std::string, std::string> cam_map;
+        const int nrows = PQntuples(cam_res);
+        for (int r = 0; r < nrows; ++r) {
+          std::string id  = PQgetvalue(cam_res, r, 0);
+          std::string mac = PQgetvalue(cam_res, r, 1);
+          if (!id.empty() && !mac.empty()) cam_map[mac] = id;
+        }
+        LOG(INFO) << "[alarm] loaded " << cam_map.size()
+                  << " camera(s) from DB";
+        absl::MutexLock lk(&mu_);
+        mac_to_camera_id_ = std::move(cam_map);
+      } else {
+        LOG(ERROR) << "[alarm] camera DB query failed: "
+                   << PQresultErrorMessage(cam_res);
+      }
+      PQclear(cam_res);
+      PQfinish(cam_conn);
+    } else {
+      LOG(ERROR) << "[alarm] camera DB connect failed: "
+                 << PQerrorMessage(cam_conn);
+      PQfinish(cam_conn);
+    }
   } else {
-    LOG(WARNING) << "[alarm] could not fetch camera list from Protect API "
-                 << "-- push thumbnails may be missing until next refresh";
+    LOG(WARNING) << "[alarm] no db_connstr configured -- camera UUID map "
+                 << "unavailable; push notifications will fire without thumbnails";
   }
 
   // ---- Step 2: load automations ----------------------------------------------
